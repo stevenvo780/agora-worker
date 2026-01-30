@@ -6,14 +6,16 @@ import pty from 'node-pty';
 const NEXUS_URL = process.env.NEXUS_URL || "http://localhost:3010";
 const WORKER_TOKEN = process.env.WORKER_TOKEN || "dev-user-123";
 const WORKSPACE_DIR_PREFIX = process.env.WORKSPACE_DIR_PREFIX || "_ws";
+const WORKSPACE_ID = process.env.WORKSPACE_ID || ""; // If set, this worker is DEDICATED to this workspace
 const SAFE_WORKSPACE_ID = /^[a-zA-Z0-9_-]+$/;
 
-console.log(`🔌 Connecting to Nexus at ${NEXUS_URL} with token ${WORKER_TOKEN}...`);
+console.log(`🔌 Connecting to Nexus at ${NEXUS_URL} with token ${WORKER_TOKEN} [Scope: ${WORKSPACE_ID || 'personal'}]...`);
 
 const socket = io(NEXUS_URL, {
   auth: {
     type: "worker",
-    workerToken: WORKER_TOKEN
+    workerToken: WORKER_TOKEN,
+    workspaceId: WORKSPACE_ID || 'personal'
   }
 });
 
@@ -45,8 +47,20 @@ socket.on("session-created", (data = {}) => {
     const { id: sessionId, workspaceId, workspaceName } = data;
     console.log(`📟 Creating PTY for session ${sessionId}`);
 
+    // LOGIC: Determine Working Directory
     let workdir = DEFAULT_WORKDIR;
-    if (workspaceId && workspaceId !== "personal") {
+
+    // Case 1: Active Dedicated Mode (Env WORKSPACE_ID is set)
+    if (WORKSPACE_ID) {
+        // If this worker is dedicated to specific workspace X,
+        // and request is for workspace X, proceed at root.
+        // If request is for Y, we shouldn't have received this event (Hub filtering),
+        // but just in case, we stick to root because we only see ONE workspace.
+        workdir = DEFAULT_WORKDIR; 
+        console.log(`🔒 Dedicated Worker (${WORKSPACE_ID}): Force Root Dir`);
+    } 
+    // Case 2: Personal Mixed Mode (Legacy/Default)
+    else if (workspaceId && workspaceId !== "personal") {
         if (SAFE_WORKSPACE_ID.test(workspaceId)) {
             workdir = path.join(DEFAULT_WORKDIR, WORKSPACE_DIR_PREFIX, workspaceId);
         } else {

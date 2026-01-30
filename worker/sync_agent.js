@@ -5,6 +5,7 @@ import chokidar from "chokidar";
 import admin from "firebase-admin";
 
 const WORKER_TOKEN = process.env.WORKER_TOKEN || "unknown-worker";
+const WORKSPACE_ID = process.env.WORKSPACE_ID || ""; // Dedicated Mode
 const BUCKET_NAME =
   process.env.FIREBASE_BUCKET || "udea-filosofia.firebasestorage.app";
 const WORKSPACE_DIR_PREFIX = process.env.WORKSPACE_DIR_PREFIX || "_ws";
@@ -114,13 +115,31 @@ class SyncManager {
     this.inFlight = new Set();
     this.downloadsInFlight = new Set();
     this.cycleInProgress = false;
-    this.mounts.push({
-      local: SYNC_DIR,
-      remote: `users/${WORKER_TOKEN}`,
-    });
+
+    // MOUNT CONFIGURATION
+    if (WORKSPACE_ID) {
+        // Mode 1: Dedicated Workspace Worker
+        // Only mounts the specific workspace at the root.
+        this.mounts.push({
+            local: SYNC_DIR,
+            remote: `workspaces/${WORKSPACE_ID}`,
+        });
+        log(`🔹 Modo Dedicado Activado: Sincronizando workspaces/${WORKSPACE_ID} en raíz.`);
+    } else {
+        // Mode 2: Personal Worker (Legacy)
+        // Mounts Personal user root + listens for shared workspaces in subfolders
+        this.mounts.push({
+            local: SYNC_DIR,
+            remote: `users/${WORKER_TOKEN}`,
+        });
+        log(`🔸 Modo Personal Activado: Sincronizando users/${WORKER_TOKEN} en raíz.`);
+    }
   }
 
   setupWorkspaceListener() {
+    // If strict Dedicated Mode is ON, we do NOT switch contexts or add dynamic mounts
+    if (WORKSPACE_ID) return;
+
     try {
       this.db
         .collection("workspaces")
