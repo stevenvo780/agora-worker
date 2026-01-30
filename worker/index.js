@@ -136,15 +136,20 @@ socket.on("resize", (data) => {
 });
 
 // Handle session end
-socket.on("end-session", (data) => {
+const killSession = (data) => {
     const { sessionId } = data;
     const ptyProcess = sessions.get(sessionId);
 
     if (ptyProcess) {
+        console.log(`💀 Killing session ${sessionId}`);
         ptyProcess.kill();
         sessions.delete(sessionId);
     }
-});
+};
+
+socket.on("end-session", killSession);
+socket.on("kill-session", killSession);
+
 
 // Cleanup on disconnect
 socket.on("disconnect", () => {
