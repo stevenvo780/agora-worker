@@ -7,6 +7,7 @@ import admin from "firebase-admin";
 const WORKER_TOKEN = process.env.WORKER_TOKEN || "unknown-worker";
 const BUCKET_NAME =
   process.env.FIREBASE_BUCKET || "udea-filosofia.firebasestorage.app";
+const WORKSPACE_DIR_PREFIX = process.env.WORKSPACE_DIR_PREFIX || "_ws";
 const SYNC_DIR = "/workspace";
 const POLL_INTERVAL_MS = 10000;
 const CLOCK_SKEW_MS = 2000;
@@ -128,18 +129,17 @@ class SyncManager {
 
       snapshot.forEach((doc) => {
         const data = doc.data() || {};
-        const rawName = String(data.name || doc.id);
-        const safeName = rawName.trim().replace(/[\\/]/g, "_") || doc.id;
-        const mountPoint = path.join(SYNC_DIR, safeName);
+        const workspaceName = String(data.name || doc.id).trim() || doc.id;
+        const mountPoint = path.join(SYNC_DIR, WORKSPACE_DIR_PREFIX, doc.id);
         const remotePrefix = `workspaces/${doc.id}`;
 
         this.mounts.push({ local: mountPoint, remote: remotePrefix });
 
         if (!fs.existsSync(mountPoint)) {
           fs.mkdirSync(mountPoint, { recursive: true });
-          log(`Montado workspace: ${safeName} -> ${remotePrefix}`);
+          log(`Montado workspace: ${workspaceName} -> ${remotePrefix}`);
         } else {
-          log(`Workspace detectado: ${safeName}`);
+          log(`Workspace detectado: ${workspaceName}`);
         }
       });
     } catch (err) {

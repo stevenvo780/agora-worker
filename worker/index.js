@@ -1,9 +1,12 @@
 import fs from 'fs';
+import path from 'path';
 import { io } from "socket.io-client";
 import pty from 'node-pty';
 
 const NEXUS_URL = process.env.NEXUS_URL || "http://localhost:3010";
 const WORKER_TOKEN = process.env.WORKER_TOKEN || "dev-user-123";
+const WORKSPACE_DIR_PREFIX = process.env.WORKSPACE_DIR_PREFIX || "_ws";
+const SAFE_WORKSPACE_ID = /^[a-zA-Z0-9_-]+$/;
 
 console.log(`🔌 Connecting to Nexus at ${NEXUS_URL} with token ${WORKER_TOKEN}...`);
 
@@ -38,9 +41,30 @@ if (!fs.existsSync(DEFAULT_WORKDIR)) {
 }
 
 // When hub tells us a session was created, spawn PTY
-socket.on("session-created", (data) => {
-    const { id: sessionId } = data;
+socket.on("session-created", (data = {}) => {
+    const { id: sessionId, workspaceId, workspaceName } = data;
     console.log(`📟 Creating PTY for session ${sessionId}`);
+
+    let workdir = DEFAULT_WORKDIR;
+    if (workspaceId && workspaceId !== "personal") {
+        if (SAFE_WORKSPACE_ID.test(workspaceId)) {
+            workdir = path.join(DEFAULT_WORKDIR, WORKSPACE_DIR_PREFIX, workspaceId);
+        } else {
+            console.warn("WorkspaceId invalido, usando /workspace");
+        }
+    }
+
+    if (!fs.existsSync(workdir)) {
+        try {
+            fs.mkdirSync(workdir, { recursive: true });
+        } catch (e) {
+            console.error("Failed to create workspace dir:", e);
+        }
+    }
+
+    if (workspaceId) {
+        console.log(`📂 Workspace: ${workspaceName || workspaceId} -> ${workdir}`);
+    }
 
     // Spawn a real bash shell with PTY
     const shell = process.env.SHELL || '/bin/bash';
@@ -48,7 +72,7 @@ socket.on("session-created", (data) => {
         name: 'xterm-256color',
         cols: 80,
         rows: 24,
-        cwd: DEFAULT_WORKDIR,
+        cwd: workdir,
         env: {
             ...process.env,
             TERM: 'xterm-256color',
