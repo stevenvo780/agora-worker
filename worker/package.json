@@ -1,0 +1,12 @@
+{
+  "name": "simple-worker",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "deb": "bash scripts/build-deb.sh"
+  },
+  "dependencies": {
+    "node-pty": "^1.0.0",
+    "socket.io-client": "^4.7.2"
+  }
+}

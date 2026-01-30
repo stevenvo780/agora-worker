@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="${ENV_FILE:-/etc/edu-worker/worker.env}"
+if [ -f "$ENV_FILE" ]; then
+  set -a
+  . "$ENV_FILE"
+  set +a
+fi
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "docker no esta instalado o no esta en PATH" >&2
+  exit 1
+fi
+
+WORKER_TOKEN="${WORKER_TOKEN:-}"
+if [ -z "$WORKER_TOKEN" ]; then
+  echo "WORKER_TOKEN es requerido" >&2
+  exit 1
+fi
+
+NEXUS_URL="${NEXUS_URL:-http://localhost:3010}"
+MOUNT_PATH="${MOUNT_PATH:-/var/lib/edu-worker/workspace}"
+SERVICE_ACCOUNT_PATH="${SERVICE_ACCOUNT_PATH:-/etc/edu-worker/serviceAccountKey.json}"
+FIREBASE_BUCKET="${FIREBASE_BUCKET:-}"
+WORKER_IMAGE="${WORKER_IMAGE:-ghcr.io/educacioncooperativa/worker:latest}"
+CONTAINER_NAME="${CONTAINER_NAME:-edu-worker}"
+AUTO_PULL="${AUTO_PULL:-0}"
+
+mkdir -p "$MOUNT_PATH"
+
+if [ "$AUTO_PULL" = "1" ] || [ "$AUTO_PULL" = "true" ]; then
+  docker pull "$WORKER_IMAGE"
+fi
+
+docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+
+args=(run --rm --name "$CONTAINER_NAME" --network=host)
+args+=(-e "NEXUS_URL=$NEXUS_URL" -e "WORKER_TOKEN=$WORKER_TOKEN")
+
+if [ -n "$FIREBASE_BUCKET" ]; then
+  args+=(-e "FIREBASE_BUCKET=$FIREBASE_BUCKET")
+fi
+
+if [ -n "${FIREBASE_SERVICE_ACCOUNT:-}" ]; then
+  args+=(-e "FIREBASE_SERVICE_ACCOUNT=$FIREBASE_SERVICE_ACCOUNT")
+fi
+
+args+=(-v "$MOUNT_PATH:/workspace")
+
+if [ -f "$SERVICE_ACCOUNT_PATH" ]; then
+  args+=(-v "$SERVICE_ACCOUNT_PATH:/app/serviceAccountKey.json:ro")
+fi
+
+exec docker "${args[@]}" "$WORKER_IMAGE"

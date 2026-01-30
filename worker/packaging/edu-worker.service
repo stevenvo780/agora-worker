@@ -1,0 +1,14 @@
+[Unit]
+Description=Education Cooperative Worker (Docker)
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/edu-worker/worker.env
+ExecStart=/usr/bin/edu-worker
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
