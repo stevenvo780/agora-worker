@@ -9,12 +9,11 @@ if [[ "$FIREBASE_SERVICE_ACCOUNT" == \{* ]]; then
 fi
 
 # Start Sync Service in background if credentials exist
-if [ -f "/app/serviceAccountKey.json" ]; then
-    echo "🔄 Starting Sync Service..."
-    # Redirect output to file to keep logs clean
-    python3 /app/sync_agent.py > /var/log/sync_agent.log 2>&1 &
+if [ -n "$FIREBASE_SERVICE_ACCOUNT" ] || [ -f "/app/serviceAccountKey.json" ]; then
+    echo "Starting Sync Service..."
+    node /app/sync_agent.js > /var/log/sync_agent.log 2>&1 &
 else
-    echo "⚠️  No serviceAccountKey.json found. Skipping Sync Service."
+    echo "No serviceAccountKey.json found. Skipping Sync Service."
 fi
 
 # Start Node Worker

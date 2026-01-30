@@ -6,6 +6,8 @@
     "deb": "bash scripts/build-deb.sh"
   },
   "dependencies": {
+    "chokidar": "^3.6.0",
+    "firebase-admin": "^12.0.0",
     "node-pty": "^1.0.0",
     "socket.io-client": "^4.7.2"
   }

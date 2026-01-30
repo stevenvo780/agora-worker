@@ -24,10 +24,6 @@ RUN apt-get update && apt-get install -y \
     iputils-ping \
     dnsutils \
     openssh-client \
-    # Python
-    python3 \
-    python3-pip \
-    python3-venv \
     # Build essentials
     ca-certificates \
     gnupg \
@@ -73,8 +69,7 @@ RUN npm install -g \
     http-server
 
 # Create symlinks for better command names
-RUN ln -sf /usr/bin/python3 /usr/bin/python && \
-    ln -sf /usr/bin/fdfind /usr/bin/fd && \
+RUN ln -sf /usr/bin/fdfind /usr/bin/fd && \
     ln -sf /usr/bin/batcat /usr/bin/bat 2>/dev/null || true
 
 # Create estudiante user with sudo privileges (passwordless)
@@ -84,17 +79,13 @@ RUN useradd -m -s /bin/bash estudiante && \
 
 WORKDIR /app
 
-# Install Python requirements for Sync Agent
-COPY requirements.txt .
-RUN pip3 install -r requirements.txt
-
 # Install Node requirements
 COPY package.json package-lock.json ./
 RUN npm ci
 
 # Copy application code
 COPY index.js .
-COPY sync_agent.py .
+COPY sync_agent.js .
 COPY entrypoint.sh .
 
 # Make entrypoint executable
