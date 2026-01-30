@@ -3,6 +3,7 @@ import os
 import sys
 import logging
 import hashlib
+import base64
 from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -15,6 +16,8 @@ WORKER_TOKEN = os.getenv("WORKER_TOKEN", "unknown-worker")
 BUCKET_NAME = os.getenv("FIREBASE_BUCKET", "udea-filosofia.firebasestorage.app") # Default or from env
 SYNC_DIR = Path("/workspace")
 POLL_INTERVAL = 10
+CLOCK_SKEW_SECONDS = 2
+DOWNLOAD_GRACE_SECONDS = 3
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger("SyncAgent")
@@ -42,6 +45,7 @@ class SyncManager:
     def __init__(self):
         self.ignore_list = ['.git', '.DS_Store', 'node_modules', '.next']
         self._is_updating = False
+        self._recent_downloads = {}
         # Map: local_path_prefix -> remote_storage_prefix
         # Default: personal workspace
         self.mounts = {
@@ -102,6 +106,32 @@ class SyncManager:
         remote = self.mounts[best_mount]
         return f"{remote}/{rel}"
 
+    def _is_ignored(self, local_path):
+        try:
+            rel = local_path.relative_to(SYNC_DIR)
+        except ValueError:
+            return True
+
+        for part in rel.parts:
+            if part in self.ignore_list:
+                return True
+            if part.startswith('.'):
+                return True
+        return False
+
+    def _local_md5_b64(self, local_path):
+        digest = hashlib.md5()
+        with open(local_path, 'rb') as handle:
+            for chunk in iter(lambda: handle.read(8192), b''):
+                digest.update(chunk)
+        return base64.b64encode(digest.digest()).decode('utf-8')
+
+    def _cleanup_recent_downloads(self):
+        now = time.time()
+        stale = [path for path, ts in self._recent_downloads.items() if now - ts > DOWNLOAD_GRACE_SECONDS]
+        for path in stale:
+            self._recent_downloads.pop(path, None)
+
     def get_local_path(self, remote_blob_name):
         """Maps remote path to local based on mounts"""
         # Iterate mounts to find which one matches this blob prefix
@@ -137,10 +167,22 @@ class SyncManager:
 
     def upload_file(self, local_path):
         if self._is_updating: return
+        if self._is_ignored(local_path): return
+        if not local_path.exists() or not local_path.is_file():
+            return
+        self._cleanup_recent_downloads()
+        if str(local_path) in self._recent_downloads:
+            return
         try:
             blob_path = self.get_remote_path(local_path)
             if not blob_path: return
-            
+
+            remote_blob = bucket.get_blob(blob_path)
+            if remote_blob and remote_blob.md5_hash:
+                local_md5 = self._local_md5_b64(local_path)
+                if remote_blob.md5_hash == local_md5:
+                    return
+
             blob = bucket.blob(blob_path)
             blob.upload_from_filename(str(local_path))
             logger.info(f"⬆️  Uploaded: {local_path.name}")
@@ -156,10 +198,15 @@ class SyncManager:
         try:
             local_path = self.get_local_path(blob.name)
             if not local_path: return
+            if self._is_ignored(local_path): return
 
             local_path.parent.mkdir(parents=True, exist_ok=True)
             blob.download_to_filename(str(local_path))
+            if blob.updated:
+                updated_ts = blob.updated.timestamp()
+                os.utime(local_path, (updated_ts, updated_ts))
             logger.info(f"⬇️  Downloaded: {local_path.name}")
+            self._recent_downloads[str(local_path)] = time.time()
         except Exception as e:
             logger.error(f"Error downloading {blob.name}: {e}")
         finally:
@@ -176,10 +223,33 @@ class SyncManager:
                     
                     local_path = self.get_local_path(blob.name)
                     if not local_path: continue
+                    if self._is_ignored(local_path): continue
 
                     if not local_path.exists():
                         self.download_file(blob)
-                    # TODO: Checksum update
+                        continue
+
+                    local_stat = local_path.stat()
+                    local_mtime = local_stat.st_mtime
+                    remote_updated = blob.updated.timestamp() if blob.updated else None
+
+                    if remote_updated is None:
+                        self.download_file(blob)
+                        continue
+
+                    if remote_updated > local_mtime + CLOCK_SKEW_SECONDS:
+                        self.download_file(blob)
+                        continue
+                    if local_mtime > remote_updated + CLOCK_SKEW_SECONDS:
+                        self.upload_file(local_path)
+                        continue
+
+                    if blob.md5_hash:
+                        local_md5 = self._local_md5_b64(local_path)
+                        if blob.md5_hash == local_md5:
+                            continue
+
+                    self.download_file(blob)
         except Exception as e:
             logger.error(f"Sync cycle error: {e}")
 
@@ -200,6 +270,7 @@ class LocalHandler(FileSystemEventHandler):
         try:
             # Ensure path is within SYNC_DIR
             path.relative_to(SYNC_DIR) 
+            if self.manager._is_ignored(path): return
             logger.info(f"📝 Local change: {path.name}")
             self.manager.upload_file(path)
         except ValueError:
