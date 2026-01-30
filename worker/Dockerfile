@@ -81,7 +81,7 @@ WORKDIR /app
 
 # Install Node requirements
 COPY package.json package-lock.json ./
-RUN npm ci
+RUN npm ci --omit=dev
 
 # Copy application code
 COPY index.js .

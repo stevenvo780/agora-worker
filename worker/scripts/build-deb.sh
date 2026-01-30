@@ -2,7 +2,13 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="$(python3 - <<PY\nimport json\nfrom pathlib import Path\npkg = json.loads(Path(\"$ROOT_DIR/package.json\").read_text())\nprint(pkg.get(\"version\", \"0.0.0\"))\nPY\n)"
+VERSION="$(python3 - <<PY
+import json
+from pathlib import Path
+pkg = json.loads(Path("$ROOT_DIR/package.json").read_text())
+print(pkg.get("version", "0.0.0"))
+PY
+)"
 
 BUILD_DIR="$ROOT_DIR/build/deb"
 DIST_DIR="$ROOT_DIR/dist"
@@ -56,5 +62,5 @@ EOF
 chmod 755 "$BUILD_DIR/DEBIAN/postinst"
 
 mkdir -p "$DIST_DIR"
-dpkg-deb --build "$BUILD_DIR" "$DIST_DIR/edu-worker_${VERSION}_amd64.deb"
+dpkg-deb --root-owner-group --build "$BUILD_DIR" "$DIST_DIR/edu-worker_${VERSION}_amd64.deb"
 echo "Paquete creado: $DIST_DIR/edu-worker_${VERSION}_amd64.deb"
