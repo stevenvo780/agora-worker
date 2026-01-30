@@ -120,31 +120,44 @@ class SyncManager {
     });
   }
 
-  async loadWorkspaceMounts() {
+  setupWorkspaceListener() {
     try {
-      const snapshot = await this.db
+      this.db
         .collection("workspaces")
         .where("members", "array-contains", WORKER_TOKEN)
-        .get();
+        .onSnapshot((snapshot) => {
+          snapshot.forEach((doc) => {
+            const data = doc.data() || {};
+            const workspaceName = String(data.name || doc.id).trim() || doc.id;
+            const mountPoint = path.join(SYNC_DIR, WORKSPACE_DIR_PREFIX, doc.id);
+            const remotePrefix = `workspaces/${doc.id}`;
 
-      snapshot.forEach((doc) => {
-        const data = doc.data() || {};
-        const workspaceName = String(data.name || doc.id).trim() || doc.id;
-        const mountPoint = path.join(SYNC_DIR, WORKSPACE_DIR_PREFIX, doc.id);
-        const remotePrefix = `workspaces/${doc.id}`;
+            // Check if already mounted
+            const exists = this.mounts.some(m => m.local === mountPoint);
+            if (!exists) {
+                this.mounts.push({ local: mountPoint, remote: remotePrefix });
 
-        this.mounts.push({ local: mountPoint, remote: remotePrefix });
-
-        if (!fs.existsSync(mountPoint)) {
-          fs.mkdirSync(mountPoint, { recursive: true });
-          log(`Montado workspace: ${workspaceName} -> ${remotePrefix}`);
-        } else {
-          log(`Workspace detectado: ${workspaceName}`);
-        }
-      });
+                if (!fs.existsSync(mountPoint)) {
+                  fs.mkdirSync(mountPoint, { recursive: true });
+                  log(`Montado workspace (Live): ${workspaceName} -> ${remotePrefix}`);
+                } else {
+                  log(`Workspace detectado (Live): ${workspaceName}`);
+                }
+            }
+          });
+          
+          // Optional: Handle removals if user is removed from workspace (complex due to local files cleanup)
+        }, (err) => {
+            log(`Error escuchando workspaces: ${err.message}`);
+        });
     } catch (err) {
-      log(`Error cargando workspaces: ${err.message}`);
+      log(`Error configurando listener de workspaces: ${err.message}`);
     }
+  }
+
+  async loadWorkspaceMounts() {
+      // Keep initial load just in case, but rely on listener mostly
+      this.setupWorkspaceListener();
   }
 
   getRemotePath(localPath) {
@@ -210,8 +223,23 @@ class SyncManager {
     this.cleanupRecentDownloads();
     if (this.recentDownloads.has(localPath)) return;
 
+    // CRITICAL FIX: Ignore files inside _ws dir if trying to upload via Root Mount
+    // This allows dedicated mounts to handle them, preventing double uploads to personal space
+    if (localPath.includes(`${path.sep}${WORKSPACE_DIR_PREFIX}${path.sep}`)) {
+        // Just rely on getRemotePath picking the specific mount because mount points are sorted/checked
+        // The issue is if a specific mount DOES NOT EXIST yet, it might default to root.
+        // We ensure mounts are live-loaded now.
+    }
+
     const remotePath = this.getRemotePath(localPath);
     if (!remotePath) return;
+
+    // Double check: if remotePath is going to Personal Space (users/...) BUT it is a workspace file
+    // abort to avoid pollution.
+    if (remotePath.startsWith(`users/${WORKER_TOKEN}`) && localPath.includes(`${path.sep}${WORKSPACE_DIR_PREFIX}${path.sep}`)) {
+        log(`Skipping upload of workspace file to personal storage: ${localPath}`);
+        return;
+    }
 
     this.inFlight.add(localPath);
     try {
@@ -277,6 +305,16 @@ class SyncManager {
 
         for (const file of files) {
           if (file.name.endsWith("/")) continue;
+          
+          // CRITICAL FIX: Prevent root mount (Personal) from processing Workspace files
+          // If current mount is the ROOT one (users/TOKEN), ignore any remote file 
+          // that technically maps to "users/TOKEN/_ws/..." because that would conflict
+          // with the dedicated workspace mount "workspaces/ID/...".
+          // This prevents downloading polluted files from ROOT to Workspace folders.
+          if (mount.local === SYNC_DIR && file.name.includes(`/${WORKSPACE_DIR_PREFIX}/`)) {
+             continue;
+          }
+
           const localPath = this.getLocalPath(file.name);
           if (!localPath) continue;
           if (isIgnoredPath(localPath)) continue;
