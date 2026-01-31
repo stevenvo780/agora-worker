@@ -12,7 +12,11 @@ import admin from "firebase-admin";
 const WORKER_TOKEN = process.env.WORKER_TOKEN || "";
 const BUCKET_NAME = process.env.FIREBASE_BUCKET || "udea-filosofia.firebasestorage.app";
 const SYNC_DIR = "/workspace";
-const POLL_INTERVAL_MS = 10000;
+const POLL_INTERVAL_MS = (() => {
+  const raw = process.env.SYNC_POLL_MS;
+  const parsed = raw ? Number(raw) : 30000;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 30000;
+})();
 const CLOCK_SKEW_MS = 2000;
 const DOWNLOAD_GRACE_MS = 3000;
 
