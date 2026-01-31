@@ -18,9 +18,12 @@ mkdir -p "$BUILD_DIR/DEBIAN" \
   "$BUILD_DIR/usr/bin" \
   "$BUILD_DIR/lib/systemd/system" \
   "$BUILD_DIR/etc/edu-worker" \
-  "$BUILD_DIR/usr/share/doc/edu-worker"
+  "$BUILD_DIR/etc/edu-worker/workers.d" \
+  "$BUILD_DIR/usr/share/doc/edu-worker" \
+  "$BUILD_DIR/var/lib/edu-worker/workspaces"
 
 install -m 755 "$ROOT_DIR/packaging/edu-worker" "$BUILD_DIR/usr/bin/edu-worker"
+install -m 755 "$ROOT_DIR/packaging/edu-worker-manager" "$BUILD_DIR/usr/bin/edu-worker-manager"
 install -m 644 "$ROOT_DIR/packaging/edu-worker.service" "$BUILD_DIR/lib/systemd/system/edu-worker.service"
 install -m 644 "$ROOT_DIR/packaging/worker.env" "$BUILD_DIR/etc/edu-worker/worker.env"
 install -m 644 "$ROOT_DIR/packaging/worker.env" "$BUILD_DIR/usr/share/doc/edu-worker/worker.env.example"
@@ -34,7 +37,9 @@ Architecture: amd64
 Depends: docker.io | docker-ce, bash
 Maintainer: Educacion Cooperativa
 Description: Worker local para Educacion Cooperativa
- Este servicio ejecuta el worker en Docker y habilita la sincronizacion de archivos.
+ Este servicio ejecuta workers en Docker para espacios de trabajo.
+ Soporta multiples workspaces con edu-worker-manager.
+ Cada workspace tiene su propio contenedor aislado.
 EOF
 
 cat > "$BUILD_DIR/DEBIAN/conffiles" << EOF
@@ -46,18 +51,35 @@ cat > "$BUILD_DIR/DEBIAN/postinst" << 'EOF'
 set -e
 
 mkdir -p /var/lib/edu-worker/workspace
+mkdir -p /var/lib/edu-worker/workspaces
+mkdir -p /etc/edu-worker/workers.d
 
 if command -v systemctl >/dev/null 2>&1; then
   systemctl daemon-reload || true
-  systemctl enable edu-worker.service || true
-
-  token="$(grep -E '^WORKER_TOKEN=' /etc/edu-worker/worker.env | cut -d= -f2- || true)"
-  if [ -n "$token" ]; then
-    systemctl restart edu-worker.service || true
-  else
-    echo "WORKER_TOKEN vacio. Edita /etc/edu-worker/worker.env y reinicia el servicio."
-  fi
 fi
+
+echo ""
+echo "=============================================="
+echo "  EDU-WORKER INSTALLED SUCCESSFULLY"
+echo "=============================================="
+echo ""
+echo "To configure a workspace worker, use:"
+echo ""
+echo "  # For personal workspace:"
+echo "  edu-worker-manager add <userId> --type personal"
+echo ""
+echo "  # For shared workspace:"
+echo "  edu-worker-manager add <workspaceId> --name 'Workspace Name'"
+echo ""
+echo "  # Start all workers:"
+echo "  edu-worker-manager start all"
+echo ""
+echo "  # Check status:"
+echo "  edu-worker-manager status"
+echo ""
+echo "Make sure to place your Firebase serviceAccountKey.json at:"
+echo "  /etc/edu-worker/serviceAccountKey.json"
+echo ""
 EOF
 chmod 755 "$BUILD_DIR/DEBIAN/postinst"
 
