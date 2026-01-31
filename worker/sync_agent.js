@@ -4,15 +4,44 @@ import crypto from "crypto";
 import chokidar from "chokidar";
 import admin from "firebase-admin";
 
-const WORKER_TOKEN = process.env.WORKER_TOKEN || "unknown-worker";
-const WORKSPACE_ID = process.env.WORKSPACE_ID || ""; // Dedicated Mode
-const BUCKET_NAME =
-  process.env.FIREBASE_BUCKET || "udea-filosofia.firebasestorage.app";
-const WORKSPACE_DIR_PREFIX = process.env.WORKSPACE_DIR_PREFIX || "_ws";
+// =====================================================
+// NEW TOKEN FORMAT: 
+// - "personal:{userId}" for personal workspaces
+// - "{workspaceId}" for shared workspaces
+// =====================================================
+const WORKER_TOKEN = process.env.WORKER_TOKEN || "";
+const BUCKET_NAME = process.env.FIREBASE_BUCKET || "udea-filosofia.firebasestorage.app";
 const SYNC_DIR = "/workspace";
 const POLL_INTERVAL_MS = 10000;
 const CLOCK_SKEW_MS = 2000;
 const DOWNLOAD_GRACE_MS = 3000;
+
+// Parse the token to understand workspace type
+function parseToken(token) {
+  if (token.startsWith('personal:')) {
+    return {
+      workspaceId: token,
+      workspaceType: 'personal',
+      userId: token.substring('personal:'.length),
+      storagePath: `users/${token.substring('personal:'.length)}`
+    };
+  }
+  return {
+    workspaceId: token,
+    workspaceType: 'shared',
+    userId: null,
+    storagePath: `workspaces/${token}`
+  };
+}
+
+const tokenInfo = parseToken(WORKER_TOKEN);
+
+if (!WORKER_TOKEN) {
+  console.error("❌ WORKER_TOKEN is required. Set it in environment variables.");
+  console.error("   For personal workspace: WORKER_TOKEN=personal:<userId>");
+  console.error("   For shared workspace: WORKER_TOKEN=<workspaceId>");
+  process.exit(1);
+}
 
 const IGNORE_LIST = new Set([".git", ".DS_Store", "node_modules", ".next"]);
 const TEXT_EXTS = new Set([
@@ -116,67 +145,30 @@ class SyncManager {
     this.downloadsInFlight = new Set();
     this.cycleInProgress = false;
 
-    // MOUNT CONFIGURATION
-    if (WORKSPACE_ID) {
-        // Mode 1: Dedicated Workspace Worker
-        // Only mounts the specific workspace at the root.
-        this.mounts.push({
-            local: SYNC_DIR,
-            remote: `workspaces/${WORKSPACE_ID}`,
-        });
-        log(`🔹 Modo Dedicado Activado: Sincronizando workspaces/${WORKSPACE_ID} en raíz.`);
+    // NEW DEDICATED MODE: Each worker serves exactly ONE workspace
+    // The token IS the workspace identifier (personal:{uid} or workspaceId)
+    this.mounts.push({
+      local: SYNC_DIR,
+      remote: tokenInfo.storagePath,
+    });
+    
+    if (tokenInfo.workspaceType === 'personal') {
+      log(`🔹 Modo Personal: Sincronizando ${tokenInfo.storagePath} para usuario ${tokenInfo.userId}`);
     } else {
-        // Mode 2: Personal Worker (Legacy)
-        // Mounts Personal user root + listens for shared workspaces in subfolders
-        this.mounts.push({
-            local: SYNC_DIR,
-            remote: `users/${WORKER_TOKEN}`,
-        });
-        log(`🔸 Modo Personal Activado: Sincronizando users/${WORKER_TOKEN} en raíz.`);
+      log(`🔹 Modo Workspace: Sincronizando ${tokenInfo.storagePath}`);
     }
   }
 
+  // No longer needed - each worker is dedicated to one workspace
   setupWorkspaceListener() {
-    // If strict Dedicated Mode is ON, we do NOT switch contexts or add dynamic mounts
-    if (WORKSPACE_ID) return;
-
-    try {
-      this.db
-        .collection("workspaces")
-        .where("members", "array-contains", WORKER_TOKEN)
-        .onSnapshot((snapshot) => {
-          snapshot.forEach((doc) => {
-            const data = doc.data() || {};
-            const workspaceName = String(data.name || doc.id).trim() || doc.id;
-            const mountPoint = path.join(SYNC_DIR, WORKSPACE_DIR_PREFIX, doc.id);
-            const remotePrefix = `workspaces/${doc.id}`;
-
-            // Check if already mounted
-            const exists = this.mounts.some(m => m.local === mountPoint);
-            if (!exists) {
-                this.mounts.push({ local: mountPoint, remote: remotePrefix });
-
-                if (!fs.existsSync(mountPoint)) {
-                  fs.mkdirSync(mountPoint, { recursive: true });
-                  log(`Montado workspace (Live): ${workspaceName} -> ${remotePrefix}`);
-                } else {
-                  log(`Workspace detectado (Live): ${workspaceName}`);
-                }
-            }
-          });
-          
-          // Optional: Handle removals if user is removed from workspace (complex due to local files cleanup)
-        }, (err) => {
-            log(`Error escuchando workspaces: ${err.message}`);
-        });
-    } catch (err) {
-      log(`Error configurando listener de workspaces: ${err.message}`);
-    }
+    // DEPRECATED: In dedicated mode, workers don't listen for workspace changes
+    // Each workspace gets its own worker instance
+    log(`ℹ️ Worker dedicado a ${tokenInfo.workspaceId} - No hay listener dinámico`);
   }
 
   async loadWorkspaceMounts() {
-      // Keep initial load just in case, but rely on listener mostly
-      this.setupWorkspaceListener();
+    // No dynamic mounts needed - single dedicated mount configured in constructor
+    log(`ℹ️ Mount configurado: ${SYNC_DIR} -> ${tokenInfo.storagePath}`);
   }
 
   getRemotePath(localPath) {
@@ -242,23 +234,11 @@ class SyncManager {
     this.cleanupRecentDownloads();
     if (this.recentDownloads.has(localPath)) return;
 
-    // CRITICAL FIX: Ignore files inside _ws dir if trying to upload via Root Mount
-    // This allows dedicated mounts to handle them, preventing double uploads to personal space
-    if (localPath.includes(`${path.sep}${WORKSPACE_DIR_PREFIX}${path.sep}`)) {
-        // Just rely on getRemotePath picking the specific mount because mount points are sorted/checked
-        // The issue is if a specific mount DOES NOT EXIST yet, it might default to root.
-        // We ensure mounts are live-loaded now.
-    }
+    // NEW DEDICATED MODE: Each worker handles exactly one workspace
+    // No need for complex cross-workspace checks
 
     const remotePath = this.getRemotePath(localPath);
     if (!remotePath) return;
-
-    // Double check: if remotePath is going to Personal Space (users/...) BUT it is a workspace file
-    // abort to avoid pollution.
-    if (remotePath.startsWith(`users/${WORKER_TOKEN}`) && localPath.includes(`${path.sep}${WORKSPACE_DIR_PREFIX}${path.sep}`)) {
-        log(`Skipping upload of workspace file to personal storage: ${localPath}`);
-        return;
-    }
 
     this.inFlight.add(localPath);
     try {
@@ -325,14 +305,8 @@ class SyncManager {
         for (const file of files) {
           if (file.name.endsWith("/")) continue;
           
-          // CRITICAL FIX: Prevent root mount (Personal) from processing Workspace files
-          // If current mount is the ROOT one (users/TOKEN), ignore any remote file 
-          // that technically maps to "users/TOKEN/_ws/..." because that would conflict
-          // with the dedicated workspace mount "workspaces/ID/...".
-          // This prevents downloading polluted files from ROOT to Workspace folders.
-          if (mount.local === SYNC_DIR && file.name.includes(`/${WORKSPACE_DIR_PREFIX}/`)) {
-             continue;
-          }
+          // NEW DEDICATED MODE: Each worker handles exactly one workspace
+          // No need for cross-workspace filtering
 
           const localPath = this.getLocalPath(file.name);
           if (!localPath) continue;

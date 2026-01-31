@@ -4,18 +4,49 @@ import { io } from "socket.io-client";
 import pty from 'node-pty';
 
 const NEXUS_URL = process.env.NEXUS_URL || "http://localhost:3010";
-const WORKER_TOKEN = process.env.WORKER_TOKEN || "dev-user-123";
-const WORKSPACE_DIR_PREFIX = process.env.WORKSPACE_DIR_PREFIX || "_ws";
-const WORKSPACE_ID = process.env.WORKSPACE_ID || ""; // If set, this worker is DEDICATED to this workspace
-const SAFE_WORKSPACE_ID = /^[a-zA-Z0-9_-]+$/;
 
-console.log(`🔌 Connecting to Nexus at ${NEXUS_URL} with token ${WORKER_TOKEN} [Scope: ${WORKSPACE_ID || 'personal'}]...`);
+// =====================================================
+// NEW TOKEN FORMAT: 
+// - "personal:{userId}" for personal workspaces
+// - "{workspaceId}" for shared workspaces
+// =====================================================
+const WORKER_TOKEN = process.env.WORKER_TOKEN || "";
+const SAFE_WORKSPACE_ID = /^[a-zA-Z0-9_:-]+$/;
+
+// Parse the token to understand workspace type
+function parseToken(token) {
+  if (token.startsWith('personal:')) {
+    return {
+      workspaceId: token,
+      workspaceType: 'personal',
+      userId: token.substring('personal:'.length)
+    };
+  }
+  return {
+    workspaceId: token,
+    workspaceType: 'shared',
+    userId: null
+  };
+}
+
+const tokenInfo = parseToken(WORKER_TOKEN);
+console.log(`🔌 Worker Configuration:`);
+console.log(`   Hub URL: ${NEXUS_URL}`);
+console.log(`   Token: ${WORKER_TOKEN}`);
+console.log(`   Type: ${tokenInfo.workspaceType}`);
+console.log(`   Workspace ID: ${tokenInfo.workspaceId}`);
+
+if (!WORKER_TOKEN) {
+  console.error("❌ WORKER_TOKEN is required. Set it in environment variables.");
+  console.error("   For personal workspace: WORKER_TOKEN=personal:<userId>");
+  console.error("   For shared workspace: WORKER_TOKEN=<workspaceId>");
+  process.exit(1);
+}
 
 const socket = io(NEXUS_URL, {
   auth: {
     type: "worker",
-    workerToken: WORKER_TOKEN,
-    workspaceId: WORKSPACE_ID || 'personal'
+    workerToken: WORKER_TOKEN
   }
 });
 
@@ -47,26 +78,13 @@ socket.on("session-created", (data = {}) => {
     const { id: sessionId, workspaceId, workspaceName } = data;
     console.log(`📟 Creating PTY for session ${sessionId}`);
 
-    // LOGIC: Determine Working Directory
-    let workdir = DEFAULT_WORKDIR;
-
-    // Case 1: Active Dedicated Mode (Env WORKSPACE_ID is set)
-    if (WORKSPACE_ID) {
-        // If this worker is dedicated to specific workspace X,
-        // and request is for workspace X, proceed at root.
-        // If request is for Y, we shouldn't have received this event (Hub filtering),
-        // but just in case, we stick to root because we only see ONE workspace.
-        workdir = DEFAULT_WORKDIR; 
-        console.log(`🔒 Dedicated Worker (${WORKSPACE_ID}): Force Root Dir`);
-    } 
-    // Case 2: Personal Mixed Mode (Legacy/Default)
-    else if (workspaceId && workspaceId !== "personal") {
-        if (SAFE_WORKSPACE_ID.test(workspaceId)) {
-            workdir = path.join(DEFAULT_WORKDIR, WORKSPACE_DIR_PREFIX, workspaceId);
-        } else {
-            console.warn("WorkspaceId invalido, usando /workspace");
-        }
-    }
+    // =====================================================
+    // WORKDIR LOGIC:
+    // This worker is DEDICATED to a single workspace (via WORKER_TOKEN)
+    // Always use /workspace as root - the sync_agent handles the correct files
+    // =====================================================
+    const workdir = DEFAULT_WORKDIR;
+    console.log(`📂 Workspace: ${workspaceName || WORKER_TOKEN} -> ${workdir}`);
 
     if (!fs.existsSync(workdir)) {
         try {
@@ -74,10 +92,6 @@ socket.on("session-created", (data = {}) => {
         } catch (e) {
             console.error("Failed to create workspace dir:", e);
         }
-    }
-
-    if (workspaceId) {
-        console.log(`📂 Workspace: ${workspaceName || workspaceId} -> ${workdir}`);
     }
 
     // Spawn a real bash shell with PTY
