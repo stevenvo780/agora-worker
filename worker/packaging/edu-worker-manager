@@ -2,11 +2,16 @@
 # edu-worker-manager: Manage multiple workspace workers
 set -euo pipefail
 
+# Load global config if exists
+if [ -f /etc/edu-worker/worker.env ]; then
+    source /etc/edu-worker/worker.env
+fi
+
 WORKERS_CONFIG_DIR="${WORKERS_CONFIG_DIR:-/etc/edu-worker/workers.d}"
 BASE_MOUNT_PATH="${BASE_MOUNT_PATH:-/var/lib/edu-worker}"
 SERVICE_ACCOUNT_PATH="${SERVICE_ACCOUNT_PATH:-/etc/edu-worker/serviceAccountKey.json}"
 WORKER_IMAGE="${WORKER_IMAGE:-ghcr.io/educacioncooperativa/worker:latest}"
-NEXUS_URL="${NEXUS_URL:-http://localhost:3010}"
+NEXUS_URL="${NEXUS_URL:-http://148.230.88.162:3010}"
 
 usage() {
     cat <<EOF
@@ -66,15 +71,24 @@ ensure_dirs() {
 
 get_container_name() {
     local workspace_id="$1"
-    # Sanitize workspace ID for container name
-    echo "edu-worker-${workspace_id}" | tr -cd '[:alnum:]-_' | head -c 63
+    # Sanitize workspace ID for container name (replace : with -)
+    echo "edu-worker-${workspace_id}" | tr ':' '-' | tr -cd '[:alnum:]-_' | head -c 63
+}
+
+# Sanitize workspace ID for file paths (replace : with _)
+get_safe_path() {
+    local workspace_id="$1"
+    echo "${workspace_id}" | tr ':' '_'
 }
 
 get_worker_token() {
     local workspace_id="$1"
     local workspace_type="$2"
     
-    if [ "$workspace_type" = "personal" ]; then
+    # Si el workspace_id ya empieza con "personal:", usarlo directamente
+    if [[ "$workspace_id" == personal:* ]]; then
+        echo "${workspace_id}"
+    elif [ "$workspace_type" = "personal" ]; then
         echo "personal:${workspace_id}"
     else
         echo "${workspace_id}"
@@ -124,19 +138,20 @@ cmd_add() {
     
     ensure_dirs
     
-    local config_file="${WORKERS_CONFIG_DIR}/${workspace_id}.conf"
-    local mount_path="${BASE_MOUNT_PATH}/workspaces/${workspace_id}"
+    local safe_id=$(get_safe_path "$workspace_id")
+    local config_file="${WORKERS_CONFIG_DIR}/${safe_id}.conf"
+    local mount_path="${BASE_MOUNT_PATH}/workspaces/${safe_id}"
     
     mkdir -p "$mount_path"
     
     cat > "$config_file" <<EOF
 # Worker configuration for workspace: ${display_name}
 # Created: $(date -Iseconds)
-WORKSPACE_ID=${workspace_id}
-WORKSPACE_NAME=${display_name}
-WORKSPACE_TYPE=${workspace_type}
-WORKER_TOKEN=$(get_worker_token "$workspace_id" "$workspace_type")
-MOUNT_PATH=${mount_path}
+WORKSPACE_ID="${workspace_id}"
+WORKSPACE_NAME="${display_name}"
+WORKSPACE_TYPE="${workspace_type}"
+WORKER_TOKEN="$(get_worker_token "$workspace_id" "$workspace_type")"
+MOUNT_PATH="${mount_path}"
 EOF
 
     echo "✅ Added workspace worker: ${display_name} (${workspace_id})"
@@ -154,7 +169,8 @@ cmd_remove() {
         usage
     fi
     
-    local config_file="${WORKERS_CONFIG_DIR}/${workspace_id}.conf"
+    local safe_id=$(get_safe_path "$workspace_id")
+    local config_file="${WORKERS_CONFIG_DIR}/${safe_id}.conf"
     local container_name=$(get_container_name "$workspace_id")
     
     # Stop the container if running
@@ -172,7 +188,8 @@ cmd_remove() {
 
 start_worker() {
     local workspace_id="$1"
-    local config_file="${WORKERS_CONFIG_DIR}/${workspace_id}.conf"
+    local safe_id=$(get_safe_path "$workspace_id")
+    local config_file="${WORKERS_CONFIG_DIR}/${safe_id}.conf"
     
     if [ ! -f "$config_file" ]; then
         echo "❌ Config not found for workspace: ${workspace_id}"
@@ -239,9 +256,10 @@ cmd_stop() {
     if [ "$target" = "all" ]; then
         for config in "${WORKERS_CONFIG_DIR}"/*.conf; do
             [ -f "$config" ] || continue
-            local ws_id=$(basename "$config" .conf)
-            local container_name=$(get_container_name "$ws_id")
-            docker stop "$container_name" 2>/dev/null && echo "Stopped: $ws_id" || true
+            source "$config"
+            local real_ws_id="${WORKSPACE_ID:-$(basename "$config" .conf)}"
+            local container_name=$(get_container_name "$real_ws_id")
+            docker stop "$container_name" 2>/dev/null && echo "Stopped: $real_ws_id" || true
         done
     else
         local container_name=$(get_container_name "$target")
@@ -268,20 +286,22 @@ cmd_status() {
         [ -f "$config" ] || continue
         
         source "$config"
-        local ws_id=$(basename "$config" .conf)
+        # Use WORKSPACE_ID from config (has original : chars) for container name
+        local real_ws_id="${WORKSPACE_ID:-$(basename "$config" .conf)}"
+        local safe_ws_id=$(basename "$config" .conf)
         
-        if [ -n "$target" ] && [ "$target" != "$ws_id" ]; then
+        if [ -n "$target" ] && [ "$target" != "$real_ws_id" ] && [ "$target" != "$safe_ws_id" ]; then
             continue
         fi
         
-        local container_name=$(get_container_name "$ws_id")
+        local container_name=$(get_container_name "$real_ws_id")
         local status="stopped"
         
         if docker ps --format '{{.Names}}' | grep -q "^${container_name}$"; then
             status="running"
         fi
         
-        local display="${WORKSPACE_NAME:-$ws_id}"
+        local display="${WORKSPACE_NAME:-$real_ws_id}"
         if [ ${#display} -gt 23 ]; then
             display="${display:0:20}..."
         fi
