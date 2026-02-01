@@ -257,7 +257,7 @@ class SyncManager {
         }
       }
 
-      await file.upload(localPath);
+      await this.bucket.upload(localPath, { destination: remotePath });
       log(`Subido: ${path.basename(localPath)}`);
       await this.updateFirestore(remotePath, localPath);
     } catch (err) {
@@ -293,16 +293,54 @@ class SyncManager {
     }
   }
 
+  // Recursively scan local directory for files
+  scanLocalFiles(dir, fileList = []) {
+    if (!fs.existsSync(dir)) return fileList;
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (isIgnoredPath(fullPath)) continue;
+      if (entry.isDirectory()) {
+        this.scanLocalFiles(fullPath, fileList);
+      } else if (entry.isFile()) {
+        fileList.push(fullPath);
+      }
+    }
+    return fileList;
+  }
+
   async syncCycle() {
     if (this.cycleInProgress) return;
     this.cycleInProgress = true;
     try {
       for (const mount of this.mounts) {
-        const [files] = await this.bucket.getFiles({
+        // Get remote files
+        const [remoteFiles] = await this.bucket.getFiles({
           prefix: `${mount.remote}/`,
         });
 
-        for (const file of files) {
+        // Build a set of remote paths for quick lookup
+        const remotePathSet = new Set();
+        for (const file of remoteFiles) {
+          if (!file.name.endsWith("/")) {
+            remotePathSet.add(file.name);
+          }
+        }
+
+        // PART 1: Scan local files and upload any that don't exist in remote
+        const localFiles = this.scanLocalFiles(mount.local);
+        for (const localPath of localFiles) {
+          const remotePath = this.getRemotePath(localPath);
+          if (!remotePath) continue;
+          
+          if (!remotePathSet.has(remotePath)) {
+            // File exists locally but not in Firebase - upload it
+            await this.uploadFile(localPath);
+          }
+        }
+
+        // PART 2: Process remote files (download new ones, sync existing)
+        for (const file of remoteFiles) {
           if (file.name.endsWith("/")) continue;
 
           const localPath = this.getLocalPath(file.name);
@@ -369,6 +407,9 @@ async function run() {
   const watcher = chokidar.watch(SYNC_DIR, {
     ignoreInitial: true,
     ignored: (filePath) => isIgnoredPath(filePath),
+    usePolling: true,
+    interval: 5000,
+    binaryInterval: 10000,
   });
 
   watcher.on("add", (filePath) => manager.uploadFile(filePath));

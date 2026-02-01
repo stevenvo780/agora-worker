@@ -152,6 +152,7 @@ WORKSPACE_NAME="${display_name}"
 WORKSPACE_TYPE="${workspace_type}"
 WORKER_TOKEN="$(get_worker_token "$workspace_id" "$workspace_type")"
 MOUNT_PATH="${mount_path}"
+FIREBASE_BUCKET="${FIREBASE_BUCKET:-}"
 EOF
 
     echo "✅ Added workspace worker: ${display_name} (${workspace_id})"
