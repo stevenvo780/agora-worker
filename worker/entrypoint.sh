@@ -1,19 +1,20 @@
 #!/bin/bash
 set -e
 
-# Create service account file from environment variable if valid JSON
-# Check if FIREBASE_SERVICE_ACCOUNT starts with { (naive check)
-if [[ "$FIREBASE_SERVICE_ACCOUNT" == \{* ]]; then
-    echo "🔑 Generating serviceAccountKey.json from ENV..."
-    echo "$FIREBASE_SERVICE_ACCOUNT" > /app/serviceAccountKey.json
-fi
+# Check for Firebase credentials
+# Priority: GOOGLE_APPLICATION_CREDENTIALS env var (mounted file)
+CREDS_FILE="${GOOGLE_APPLICATION_CREDENTIALS:-/app/credentials/serviceAccountKey.json}"
 
-# Start Sync Service in background if credentials exist
-if [ -n "$FIREBASE_SERVICE_ACCOUNT" ] || [ -f "/app/serviceAccountKey.json" ]; then
+if [ -f "$CREDS_FILE" ]; then
+    echo "🔑 Using Firebase credentials from: $CREDS_FILE"
+    export GOOGLE_APPLICATION_CREDENTIALS="$CREDS_FILE"
+    
+    # Start Sync Service in background
     echo "Starting Sync Service..."
     node /app/sync_agent.js > /var/log/sync_agent.log 2>&1 &
 else
-    echo "No serviceAccountKey.json found. Skipping Sync Service."
+    echo "⚠️  No Firebase credentials found. Skipping Sync Service."
+    echo "   Expected at: $CREDS_FILE"
 fi
 
 # Start Node Worker

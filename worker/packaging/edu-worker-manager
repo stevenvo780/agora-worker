@@ -212,8 +212,14 @@ start_worker() {
     args+=(-v "${MOUNT_PATH}:/workspace")
     args+=(--restart unless-stopped)
     
+    # Mount Firebase service account file if exists
     if [ -f "$SERVICE_ACCOUNT_PATH" ]; then
-        args+=(-v "${SERVICE_ACCOUNT_PATH}:/app/serviceAccountKey.json:ro")
+        args+=(-v "${SERVICE_ACCOUNT_PATH}:/app/credentials/serviceAccountKey.json:ro")
+        args+=(-e "GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/serviceAccountKey.json")
+    fi
+    
+    if [ -n "${FIREBASE_BUCKET:-}" ]; then
+        args+=(-e "FIREBASE_BUCKET=$FIREBASE_BUCKET")
     fi
     
     docker "${args[@]}" "$WORKER_IMAGE"

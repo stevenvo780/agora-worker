@@ -76,6 +76,17 @@ function getServiceAccount() {
     }
   }
 
+  // Check GOOGLE_APPLICATION_CREDENTIALS env var first
+  const envCredPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+  if (envCredPath && fs.existsSync(envCredPath)) {
+    try {
+      return readJsonFile(envCredPath);
+    } catch (err) {
+      log(`No se pudo leer ${envCredPath}: ${err.message}`);
+    }
+  }
+
+  // Fallback to default path
   const credPath = "/app/serviceAccountKey.json";
   if (fs.existsSync(credPath)) {
     try {

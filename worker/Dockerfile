@@ -88,6 +88,9 @@ COPY index.js .
 COPY sync_agent.js .
 COPY entrypoint.sh .
 
+# Clean up any stale serviceAccountKey.json directory from cache
+RUN rm -rf /app/serviceAccountKey.json 2>/dev/null || true
+
 # Make entrypoint executable
 RUN chmod +x entrypoint.sh
 

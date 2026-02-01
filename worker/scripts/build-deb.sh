@@ -25,7 +25,8 @@ mkdir -p "$BUILD_DIR/DEBIAN" \
 install -m 755 "$ROOT_DIR/packaging/edu-worker" "$BUILD_DIR/usr/bin/edu-worker"
 install -m 755 "$ROOT_DIR/packaging/edu-worker-manager" "$BUILD_DIR/usr/bin/edu-worker-manager"
 install -m 644 "$ROOT_DIR/packaging/edu-worker.service" "$BUILD_DIR/lib/systemd/system/edu-worker.service"
-install -m 644 "$ROOT_DIR/packaging/worker.env" "$BUILD_DIR/etc/edu-worker/worker.env"
+install -m 600 "$ROOT_DIR/packaging/worker.env" "$BUILD_DIR/etc/edu-worker/worker.env"
+install -m 600 "$ROOT_DIR/packaging/serviceAccountKey.json" "$BUILD_DIR/etc/edu-worker/serviceAccountKey.json"
 install -m 644 "$ROOT_DIR/packaging/worker.env" "$BUILD_DIR/usr/share/doc/edu-worker/worker.env.example"
 
 cat > "$BUILD_DIR/DEBIAN/control" << EOF
@@ -44,18 +45,34 @@ EOF
 
 cat > "$BUILD_DIR/DEBIAN/conffiles" << EOF
 /etc/edu-worker/worker.env
+/etc/edu-worker/serviceAccountKey.json
 EOF
 
 cat > "$BUILD_DIR/DEBIAN/postinst" << 'EOF'
 #!/bin/bash
 set -e
 
-mkdir -p /var/lib/edu-worker/workspace
-mkdir -p /var/lib/edu-worker/workspaces
+# Get actual user (not root during sudo install)
+ACTUAL_USER="${SUDO_USER:-$USER}"
+ACTUAL_HOME=$(getent passwd "$ACTUAL_USER" | cut -d: -f6)
+
+# Create directories
 mkdir -p /etc/edu-worker/workers.d
+mkdir -p "$ACTUAL_HOME/edu-worker/workspaces"
+chown -R "$ACTUAL_USER:$ACTUAL_USER" "$ACTUAL_HOME/edu-worker"
+
+# Set BASE_MOUNT_PATH in worker.env
+if grep -q "^BASE_MOUNT_PATH=$" /etc/edu-worker/worker.env 2>/dev/null; then
+  sed -i "s|^BASE_MOUNT_PATH=$|BASE_MOUNT_PATH=$ACTUAL_HOME/edu-worker|g" /etc/edu-worker/worker.env
+fi
 
 if command -v systemctl >/dev/null 2>&1; then
   systemctl daemon-reload || true
+fi
+
+# Connect Docker Snap interface if using snap
+if command -v snap >/dev/null 2>&1 && snap list docker >/dev/null 2>&1; then
+  snap connect docker:removable-media 2>/dev/null || true
 fi
 
 echo ""
@@ -63,22 +80,21 @@ echo "=============================================="
 echo "  EDU-WORKER INSTALLED SUCCESSFULLY"
 echo "=============================================="
 echo ""
+echo "Workspace files will be stored in: $ACTUAL_HOME/edu-worker/workspaces/"
+echo ""
 echo "To configure a workspace worker, use:"
 echo ""
 echo "  # For personal workspace:"
-echo "  edu-worker-manager add <userId> --type personal"
+echo "  sudo edu-worker-manager add <userId> --type personal"
 echo ""
 echo "  # For shared workspace:"
-echo "  edu-worker-manager add <workspaceId> --name 'Workspace Name'"
+echo "  sudo edu-worker-manager add <workspaceId> --name 'Workspace Name'"
 echo ""
 echo "  # Start all workers:"
-echo "  edu-worker-manager start all"
+echo "  sudo edu-worker-manager start all"
 echo ""
 echo "  # Check status:"
-echo "  edu-worker-manager status"
-echo ""
-echo "Make sure to place your Firebase serviceAccountKey.json at:"
-echo "  /etc/edu-worker/serviceAccountKey.json"
+echo "  sudo edu-worker-manager status"
 echo ""
 EOF
 chmod 755 "$BUILD_DIR/DEBIAN/postinst"
