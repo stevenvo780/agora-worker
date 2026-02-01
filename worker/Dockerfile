@@ -93,7 +93,7 @@ RUN chmod +x entrypoint.sh
 
 # Environment defaults
 ENV NEXUS_URL=http://localhost:3010
-ENV WORKER_TOKEN=mock-token
+# WORKER_TOKEN must be provided at runtime (e.g., personal:<uid> or shared:<workspace-id>)
 
 # Default command
 CMD ["./entrypoint.sh"]
