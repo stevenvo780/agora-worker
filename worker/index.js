@@ -45,15 +45,32 @@ const socket = io(NEXUS_URL, {
   auth: {
     type: "worker",
     workerToken: WORKER_TOKEN
-  }
+  },
+  transports: ['websocket'],  // Solo websocket, evita duplicados de polling
+  reconnection: true,
+  reconnectionDelay: 1000,
+  reconnectionDelayMax: 5000,
+  reconnectionAttempts: Infinity
 });
 
 socket.on("connect", () => {
-  console.log("✅ Connected to Hub!");
+  console.log(`✅ Connected to Hub! (Socket ID: ${socket.id})`);
 });
 
 socket.on("connect_error", (err) => {
   console.error("❌ Connection Error:", err.message);
+});
+
+socket.on("disconnect", (reason) => {
+  console.log(`🔌 Disconnected from Hub: ${reason}`);
+});
+
+socket.on("reconnect", (attemptNumber) => {
+  console.log(`🔄 Reconnected to Hub after ${attemptNumber} attempts`);
+});
+
+socket.on("reconnect_attempt", (attemptNumber) => {
+  console.log(`🔄 Reconnection attempt #${attemptNumber}...`);
 });
 
 const sessions = new Map();
