@@ -72,17 +72,11 @@ socket.on("session-created", (data = {}) => {
     const { id: sessionId, workspaceId, workspaceName } = data;
     console.log(`📟 Creating PTY for session ${sessionId}`);
 
-    // Ignore sessions that do not belong to this dedicated worker
     if (workspaceId && workspaceId !== tokenInfo.workspaceId) {
         console.warn(`⚠️ Ignoring session ${sessionId} for workspace ${workspaceId} (expected ${tokenInfo.workspaceId})`);
         return;
     }
 
-    // =====================================================
-    // WORKDIR LOGIC:
-    // This worker is DEDICATED to a single workspace (via WORKER_TOKEN)
-    // Always use /workspace as root - the sync_agent handles the correct files
-    // =====================================================
     const workdir = DEFAULT_WORKDIR;
     console.log(`📂 Workspace: ${workspaceName || WORKER_TOKEN} -> ${workdir}`);
 
@@ -94,7 +88,6 @@ socket.on("session-created", (data = {}) => {
         }
     }
 
-    // Spawn a real bash shell with PTY
     const shell = process.env.SHELL || '/bin/bash';
     const ptyProcess = pty.spawn(shell, [], {
         name: 'xterm-256color',
@@ -111,12 +104,10 @@ socket.on("session-created", (data = {}) => {
 
     sessions.set(sessionId, ptyProcess);
 
-    // Forward PTY output to client
     ptyProcess.onData((data) => {
         socket.emit("output", { sessionId, data });
     });
 
-    // Handle PTY exit
     ptyProcess.onExit(({ exitCode }) => {
         console.log(`📟 PTY for session ${sessionId} exited with code ${exitCode}`);
         sessions.delete(sessionId);
@@ -124,18 +115,15 @@ socket.on("session-created", (data = {}) => {
     });
 });
 
-// Receive input from client
 socket.on("execute", (data) => {
     const { sessionId, command } = data;
     const ptyProcess = sessions.get(sessionId);
 
     if (ptyProcess) {
-        // Write raw input to PTY (bash handles Tab, Ctrl+C, etc.)
         ptyProcess.write(command);
     }
 });
 
-// Handle terminal resize
 socket.on("resize", (data) => {
     const { sessionId, cols, rows } = data;
     const ptyProcess = sessions.get(sessionId);
@@ -149,7 +137,6 @@ socket.on("resize", (data) => {
     }
 });
 
-// Handle session end
 const killSession = (data) => {
     const { sessionId } = data;
     const ptyProcess = sessions.get(sessionId);
@@ -165,7 +152,6 @@ socket.on("end-session", killSession);
 socket.on("kill-session", killSession);
 
 
-// Cleanup on disconnect
 socket.on("disconnect", () => {
     console.log("🔌 Disconnected from Hub, cleaning up sessions...");
     for (const ptyProcess of sessions.values()) {
