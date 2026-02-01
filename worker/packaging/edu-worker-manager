@@ -10,7 +10,7 @@ fi
 WORKERS_CONFIG_DIR="${WORKERS_CONFIG_DIR:-/etc/edu-worker/workers.d}"
 BASE_MOUNT_PATH="${BASE_MOUNT_PATH:-/var/lib/edu-worker}"
 SERVICE_ACCOUNT_PATH="${SERVICE_ACCOUNT_PATH:-/etc/edu-worker/serviceAccountKey.json}"
-WORKER_IMAGE="${WORKER_IMAGE:-ghcr.io/educacioncooperativa/worker:latest}"
+WORKER_IMAGE="${WORKER_IMAGE:-stevenvo780/edu-worker:latest}"
 NEXUS_URL="${NEXUS_URL:-http://148.230.88.162:3010}"
 
 usage() {

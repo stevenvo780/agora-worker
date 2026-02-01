@@ -23,7 +23,7 @@ NEXUS_URL="${NEXUS_URL:-http://localhost:3010}"
 MOUNT_PATH="${MOUNT_PATH:-/var/lib/edu-worker/workspace}"
 SERVICE_ACCOUNT_PATH="${SERVICE_ACCOUNT_PATH:-/etc/edu-worker/serviceAccountKey.json}"
 FIREBASE_BUCKET="${FIREBASE_BUCKET:-}"
-WORKER_IMAGE="${WORKER_IMAGE:-ghcr.io/educacioncooperativa/worker:latest}"
+WORKER_IMAGE="${WORKER_IMAGE:-stevenvo780/edu-worker:latest}"
 CONTAINER_NAME="${CONTAINER_NAME:-edu-worker}"
 AUTO_PULL="${AUTO_PULL:-0}"
 WORKSPACE_DIR_PREFIX="${WORKSPACE_DIR_PREFIX:-_ws}"
@@ -51,7 +51,8 @@ fi
 args+=(-v "$MOUNT_PATH:/workspace")
 
 if [ -f "$SERVICE_ACCOUNT_PATH" ]; then
-  args+=(-v "$SERVICE_ACCOUNT_PATH:/app/serviceAccountKey.json:ro")
+  args+=(-v "$SERVICE_ACCOUNT_PATH:/app/credentials/serviceAccountKey.json:ro")
+  args+=(-e "GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/serviceAccountKey.json")
 fi
 
 exec docker "${args[@]}" "$WORKER_IMAGE"
