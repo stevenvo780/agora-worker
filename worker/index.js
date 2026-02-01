@@ -1,5 +1,4 @@
 import fs from 'fs';
-import path from 'path';
 import { io } from "socket.io-client";
 import pty from 'node-pty';
 
@@ -12,6 +11,11 @@ const NEXUS_URL = process.env.NEXUS_URL || "http://localhost:3010";
 // =====================================================
 const WORKER_TOKEN = process.env.WORKER_TOKEN || "";
 const SAFE_WORKSPACE_ID = /^[a-zA-Z0-9_:-]+$/;
+
+if (WORKER_TOKEN && !SAFE_WORKSPACE_ID.test(WORKER_TOKEN)) {
+  console.error("❌ WORKER_TOKEN contains invalid characters.");
+  process.exit(1);
+}
 
 // Parse the token to understand workspace type
 function parseToken(token) {
@@ -77,6 +81,12 @@ if (!fs.existsSync(DEFAULT_WORKDIR)) {
 socket.on("session-created", (data = {}) => {
     const { id: sessionId, workspaceId, workspaceName } = data;
     console.log(`📟 Creating PTY for session ${sessionId}`);
+
+    // Ignore sessions that do not belong to this dedicated worker
+    if (workspaceId && workspaceId !== tokenInfo.workspaceId) {
+        console.warn(`⚠️ Ignoring session ${sessionId} for workspace ${workspaceId} (expected ${tokenInfo.workspaceId})`);
+        return;
+    }
 
     // =====================================================
     // WORKDIR LOGIC:
