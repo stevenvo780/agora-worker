@@ -4,11 +4,6 @@ import crypto from "crypto";
 import chokidar from "chokidar";
 import admin from "firebase-admin";
 
-// =====================================================
-// NEW TOKEN FORMAT: 
-// - "personal:{userId}" for personal workspaces
-// - "{workspaceId}" for shared workspaces
-// =====================================================
 const WORKER_TOKEN = process.env.WORKER_TOKEN || "";
 const BUCKET_NAME = process.env.FIREBASE_BUCKET || "udea-filosofia.firebasestorage.app";
 const SYNC_DIR = "/workspace";
@@ -20,7 +15,6 @@ const POLL_INTERVAL_MS = (() => {
 const CLOCK_SKEW_MS = 2000;
 const DOWNLOAD_GRACE_MS = 3000;
 
-// Parse the token to understand workspace type
 function parseToken(token) {
   if (token.startsWith('personal:')) {
     return {
@@ -149,8 +143,6 @@ class SyncManager {
     this.downloadsInFlight = new Set();
     this.cycleInProgress = false;
 
-    // NEW DEDICATED MODE: Each worker serves exactly ONE workspace
-    // The token IS the workspace identifier (personal:{uid} or workspaceId)
     this.mounts.push({
       local: SYNC_DIR,
       remote: tokenInfo.storagePath,
@@ -163,15 +155,11 @@ class SyncManager {
     }
   }
 
-  // No longer needed - each worker is dedicated to one workspace
   setupWorkspaceListener() {
-    // DEPRECATED: In dedicated mode, workers don't listen for workspace changes
-    // Each workspace gets its own worker instance
     log(`ℹ️ Worker dedicado a ${tokenInfo.workspaceId} - No hay listener dinámico`);
   }
 
   async loadWorkspaceMounts() {
-    // No dynamic mounts needed - single dedicated mount configured in constructor
     log(`ℹ️ Mount configurado: ${SYNC_DIR} -> ${tokenInfo.storagePath}`);
   }
 
@@ -237,9 +225,6 @@ class SyncManager {
     if (!fs.existsSync(localPath) || !fs.statSync(localPath).isFile()) return;
     this.cleanupRecentDownloads();
     if (this.recentDownloads.has(localPath)) return;
-
-    // NEW DEDICATED MODE: Each worker handles exactly one workspace
-    // No need for complex cross-workspace checks
 
     const remotePath = this.getRemotePath(localPath);
     if (!remotePath) return;
@@ -308,9 +293,6 @@ class SyncManager {
 
         for (const file of files) {
           if (file.name.endsWith("/")) continue;
-          
-          // NEW DEDICATED MODE: Each worker handles exactly one workspace
-          // No need for cross-workspace filtering
 
           const localPath = this.getLocalPath(file.name);
           if (!localPath) continue;
