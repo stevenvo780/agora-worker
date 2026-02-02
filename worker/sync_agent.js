@@ -3,8 +3,10 @@ import path from "path";
 import crypto from "crypto";
 import chokidar from "chokidar";
 import admin from "firebase-admin";
+import { io } from "socket.io-client";
 
 const WORKER_TOKEN = process.env.WORKER_TOKEN || "";
+const NEXUS_URL = process.env.NEXUS_URL || "http://localhost:3010";
 const BUCKET_NAME = process.env.FIREBASE_BUCKET || "udea-filosofia.firebasestorage.app";
 const SYNC_DIR = "/workspace";
 const POLL_INTERVAL_MS = (() => {
@@ -145,9 +147,10 @@ function md5Base64(filePath) {
 }
 
 class SyncManager {
-  constructor(bucket, db) {
+  constructor(bucket, db, socket) {
     this.bucket = bucket;
     this.db = db;
+    this.socket = socket;
     this.mounts = [];
     this.recentDownloads = new Map();
     this.inFlight = new Set();
@@ -163,6 +166,21 @@ class SyncManager {
       log(`🔹 Modo Personal: Sincronizando ${tokenInfo.storagePath} para usuario ${tokenInfo.userId}`);
     } else {
       log(`🔹 Modo Workspace: Sincronizando ${tokenInfo.storagePath}`);
+    }
+  }
+
+  // Notificar al Hub que hubo un cambio de documentos
+  notifyFileChange(action, fileName, docId = null) {
+    if (this.socket && this.socket.connected) {
+      this.socket.emit('doc-change', {
+        workspaceId: tokenInfo.workspaceId,
+        action, // 'created', 'updated', 'deleted'
+        docId,
+        data: {
+          name: fileName
+        }
+      });
+      log(`📡 Notificado: ${action} ${fileName}`);
     }
   }
 
@@ -210,6 +228,8 @@ class SyncManager {
   async updateFirestore(remotePath, localPath) {
     try {
       if (!TEXT_EXTS.has(path.extname(localPath).toLowerCase())) {
+        // Para archivos no-texto, solo notificar el cambio
+        this.notifyFileChange('updated', path.basename(localPath));
         return;
       }
       const content = fs.readFileSync(localPath, "utf8");
@@ -234,6 +254,7 @@ class SyncManager {
         };
         const newDoc = await this.db.collection("documents").add(docData);
         log(`Firestore documento creado: ${newDoc.id} (${fileName})`);
+        this.notifyFileChange('created', fileName, newDoc.id);
       } else {
         snapshot.forEach((doc) => {
           doc.ref.update({
@@ -241,6 +262,7 @@ class SyncManager {
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
           log(`Firestore actualizado: ${doc.id}`);
+          this.notifyFileChange('updated', path.basename(localPath), doc.id);
         });
       }
     } catch (err) {
@@ -413,13 +435,34 @@ async function run() {
     return;
   }
 
+  // Conectar al Hub para notificar cambios de archivos
+  const socket = io(NEXUS_URL, {
+    auth: {
+      type: "sync-agent",
+      workerToken: WORKER_TOKEN
+    },
+    transports: ['websocket'],
+    reconnection: true,
+    reconnectionDelay: 1000,
+    reconnectionDelayMax: 5000,
+    reconnectionAttempts: Infinity
+  });
+
+  socket.on("connect", () => {
+    log(`📡 Conectado al Hub para notificaciones (Socket ID: ${socket.id})`);
+  });
+
+  socket.on("connect_error", (err) => {
+    log(`⚠️ Error conectando al Hub: ${err.message}`);
+  });
+
   ensureFirebase();
   const bucket = admin.storage().bucket();
   const db = admin.firestore();
 
   log(`Conectado a Firebase Storage: ${BUCKET_NAME}`);
 
-  const manager = new SyncManager(bucket, db);
+  const manager = new SyncManager(bucket, db, socket);
   await manager.loadWorkspaceMounts();
 
   const watcher = chokidar.watch(SYNC_DIR, {
