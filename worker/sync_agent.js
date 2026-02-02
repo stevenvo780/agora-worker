@@ -153,9 +153,12 @@ class SyncManager {
     this.socket = socket;
     this.mounts = [];
     this.recentDownloads = new Map();
+    this.recentLocalChanges = new Map(); // Para evitar loops: local -> firebase -> local
     this.inFlight = new Set();
     this.downloadsInFlight = new Set();
     this.cycleInProgress = false;
+    this.firestoreUnsubscribe = null;
+    this.knownRemoteFiles = new Set(); // Tracking de archivos remotos conocidos
 
     this.mounts.push({
       local: SYNC_DIR,
@@ -167,6 +170,27 @@ class SyncManager {
     } else {
       log(`🔹 Modo Workspace: Sincronizando ${tokenInfo.storagePath}`);
     }
+  }
+
+  // Marcar que un cambio local está en progreso (evita loops)
+  markLocalChange(localPath) {
+    this.recentLocalChanges.set(localPath, Date.now());
+  }
+
+  // Limpiar cambios locales antiguos
+  cleanupLocalChanges() {
+    const now = Date.now();
+    for (const [filePath, ts] of this.recentLocalChanges.entries()) {
+      if (now - ts > 5000) { // 5 segundos de gracia
+        this.recentLocalChanges.delete(filePath);
+      }
+    }
+  }
+
+  // Verificar si un cambio viene de una acción local reciente
+  isRecentLocalChange(localPath) {
+    this.cleanupLocalChanges();
+    return this.recentLocalChanges.has(localPath);
   }
 
   // Notificar al Hub que hubo un cambio de documentos
@@ -186,6 +210,131 @@ class SyncManager {
 
   setupWorkspaceListener() {
     log(`ℹ️ Worker dedicado a ${tokenInfo.workspaceId} - No hay listener dinámico`);
+  }
+
+  // Listener de Firestore para sincronización bidireccional en tiempo real
+  setupFirestoreListener() {
+    log(`🔔 Configurando listener de Firestore para ${tokenInfo.workspaceId}...`);
+    
+    // Query para documentos de este workspace
+    let query;
+    if (tokenInfo.workspaceType === 'personal') {
+      query = this.db.collection("documents")
+        .where("ownerId", "==", tokenInfo.userId);
+    } else {
+      query = this.db.collection("documents")
+        .where("workspaceId", "==", tokenInfo.workspaceId);
+    }
+
+    this.firestoreUnsubscribe = query.onSnapshot(
+      (snapshot) => {
+        snapshot.docChanges().forEach(async (change) => {
+          const doc = change.doc;
+          const data = doc.data();
+          
+          if (!data.storagePath) return;
+          
+          const localPath = this.getLocalPath(data.storagePath);
+          if (!localPath) return;
+          
+          // Evitar procesar cambios que nosotros mismos causamos
+          if (this.isRecentLocalChange(localPath)) {
+            log(`⏭️ Ignorando cambio propio: ${data.name || doc.id}`);
+            return;
+          }
+
+          if (change.type === 'added' || change.type === 'modified') {
+            // Descargar/actualizar archivo desde Firebase
+            await this.syncDocumentToLocal(data, localPath);
+          } else if (change.type === 'removed') {
+            // Borrar archivo local cuando se borra de Firebase
+            await this.deleteLocalFile(localPath, data.name || doc.id);
+          }
+        });
+      },
+      (error) => {
+        log(`❌ Error en listener de Firestore: ${error.message}`);
+      }
+    );
+
+    log(`✅ Listener de Firestore activo`);
+  }
+
+  // Sincronizar un documento de Firestore al archivo local
+  async syncDocumentToLocal(docData, localPath) {
+    try {
+      // Para archivos de texto, usar el contenido de Firestore
+      const ext = path.extname(localPath).toLowerCase();
+      if (TEXT_EXTS.has(ext) && docData.content !== undefined) {
+        // Verificar si el contenido local es diferente
+        if (fs.existsSync(localPath)) {
+          const localContent = fs.readFileSync(localPath, 'utf8');
+          if (localContent === docData.content) {
+            return; // Sin cambios
+          }
+        }
+        
+        // Crear directorio si no existe
+        fs.mkdirSync(path.dirname(localPath), { recursive: true });
+        
+        // Escribir contenido
+        fs.writeFileSync(localPath, docData.content, 'utf8');
+        this.recentDownloads.set(localPath, Date.now());
+        log(`📥 Sincronizado desde Firestore: ${docData.name || path.basename(localPath)}`);
+      } else {
+        // Para archivos binarios, descargar de Storage
+        const file = this.bucket.file(docData.storagePath);
+        const [exists] = await file.exists();
+        if (exists) {
+          fs.mkdirSync(path.dirname(localPath), { recursive: true });
+          await file.download({ destination: localPath });
+          this.recentDownloads.set(localPath, Date.now());
+          log(`📥 Descargado desde Storage: ${docData.name || path.basename(localPath)}`);
+        }
+      }
+    } catch (err) {
+      log(`❌ Error sincronizando documento a local: ${err.message}`);
+    }
+  }
+
+  // Borrar archivo local cuando se elimina de Firebase
+  async deleteLocalFile(localPath, fileName) {
+    try {
+      if (fs.existsSync(localPath)) {
+        fs.unlinkSync(localPath);
+        log(`🗑️ Archivo local eliminado: ${fileName}`);
+        
+        // Limpiar directorio padre si está vacío
+        const parentDir = path.dirname(localPath);
+        if (parentDir !== SYNC_DIR) {
+          try {
+            const files = fs.readdirSync(parentDir);
+            if (files.length === 0) {
+              fs.rmdirSync(parentDir);
+              log(`🗑️ Directorio vacío eliminado: ${path.basename(parentDir)}`);
+            }
+          } catch (_err) {
+            // Ignorar errores al limpiar directorios
+          }
+        }
+      }
+    } catch (err) {
+      log(`❌ Error eliminando archivo local: ${err.message}`);
+    }
+  }
+
+  // También borrar archivo de Storage cuando se elimina de Firestore
+  async deleteFromStorage(storagePath, fileName) {
+    try {
+      const file = this.bucket.file(storagePath);
+      const [exists] = await file.exists();
+      if (exists) {
+        await file.delete();
+        log(`🗑️ Archivo eliminado de Storage: ${fileName}`);
+      }
+    } catch (err) {
+      log(`❌ Error eliminando de Storage: ${err.message}`);
+    }
   }
 
   async loadWorkspaceMounts() {
@@ -280,6 +429,9 @@ class SyncManager {
     const remotePath = this.getRemotePath(localPath);
     if (!remotePath) return;
 
+    // Marcar como cambio local para evitar que el listener lo procese de vuelta
+    this.markLocalChange(localPath);
+
     this.inFlight.add(localPath);
     try {
       const file = this.bucket.file(remotePath);
@@ -354,7 +506,7 @@ class SyncManager {
     this.cycleInProgress = true;
     try {
       for (const mount of this.mounts) {
-        // Get remote files
+        // Get remote files from Storage
         const [remoteFiles] = await this.bucket.getFiles({
           prefix: `${mount.remote}/`,
         });
@@ -367,14 +519,44 @@ class SyncManager {
           }
         }
 
-        // PART 1: Scan local files and upload any that don't exist in remote
+        // También obtener documentos de Firestore para detectar borrados
+        let firestoreDocsQuery;
+        if (tokenInfo.workspaceType === 'personal') {
+          firestoreDocsQuery = this.db.collection("documents")
+            .where("ownerId", "==", tokenInfo.userId);
+        } else {
+          firestoreDocsQuery = this.db.collection("documents")
+            .where("workspaceId", "==", tokenInfo.workspaceId);
+        }
+        const firestoreDocs = await firestoreDocsQuery.get();
+        const firestorePathSet = new Set();
+        firestoreDocs.forEach(doc => {
+          const data = doc.data();
+          if (data.storagePath) {
+            firestorePathSet.add(data.storagePath);
+          }
+        });
+
+        // PART 1: Scan local files
         const localFiles = this.scanLocalFiles(mount.local);
+        const localPathSet = new Set(localFiles);
+        
         for (const localPath of localFiles) {
           const remotePath = this.getRemotePath(localPath);
           if (!remotePath) continue;
           
+          // Verificar si el archivo fue borrado de Firestore (para archivos de texto)
+          const ext = path.extname(localPath).toLowerCase();
+          if (TEXT_EXTS.has(ext) && !firestorePathSet.has(remotePath)) {
+            // El archivo existe localmente pero fue borrado de Firestore
+            // Borrarlo localmente también
+            log(`🗑️ Detectado archivo borrado de Firestore: ${path.basename(localPath)}`);
+            await this.deleteLocalFile(localPath, path.basename(localPath));
+            continue;
+          }
+          
           if (!remotePathSet.has(remotePath)) {
-            // File exists locally but not in Firebase - upload it
+            // File exists locally but not in Firebase Storage - upload it
             await this.uploadFile(localPath);
           }
         }
@@ -419,6 +601,23 @@ class SyncManager {
           }
 
           await this.downloadFile(file);
+        }
+
+        // PART 3: Detectar archivos que existen en Storage pero no en Firestore (huérfanos)
+        // y archivos borrados de Storage que aún existen localmente
+        for (const localPath of localFiles) {
+          const remotePath = this.getRemotePath(localPath);
+          if (!remotePath) continue;
+          
+          // Si no existe en Storage ni en Firestore, borrar localmente
+          if (!remotePathSet.has(remotePath) && !firestorePathSet.has(remotePath)) {
+            const ext = path.extname(localPath).toLowerCase();
+            // Solo borrar si es un archivo de texto rastreado
+            if (TEXT_EXTS.has(ext)) {
+              log(`🗑️ Archivo huérfano detectado, borrando: ${path.basename(localPath)}`);
+              await this.deleteLocalFile(localPath, path.basename(localPath));
+            }
+          }
         }
       }
     } catch (err) {
@@ -465,6 +664,16 @@ async function run() {
   const manager = new SyncManager(bucket, db, socket);
   await manager.loadWorkspaceMounts();
 
+  // Configurar listener de Firestore para sincronización bidireccional en tiempo real
+  manager.setupFirestoreListener();
+
+  // Escuchar eventos del Hub para sincronización inmediata
+  socket.on("remote-doc-change", async (data) => {
+    log(`📨 Evento remoto recibido: ${data.action} ${data.docId || ''}`);
+    // Forzar un ciclo de sincronización inmediato
+    await manager.syncCycle();
+  });
+
   const watcher = chokidar.watch(SYNC_DIR, {
     ignoreInitial: true,
     ignored: (filePath) => isIgnoredPath(filePath),
@@ -475,8 +684,46 @@ async function run() {
 
   watcher.on("add", (filePath) => manager.uploadFile(filePath));
   watcher.on("change", (filePath) => manager.uploadFile(filePath));
+  
+  // Detectar borrados locales y propagarlos a Firebase
+  watcher.on("unlink", async (filePath) => {
+    const remotePath = manager.getRemotePath(filePath);
+    if (!remotePath) return;
+    
+    log(`🗑️ Archivo local eliminado: ${path.basename(filePath)}`);
+    
+    try {
+      // Buscar y borrar el documento de Firestore
+      const snapshot = await db
+        .collection("documents")
+        .where("storagePath", "==", remotePath)
+        .limit(1)
+        .get();
+      
+      if (!snapshot.empty) {
+        const doc = snapshot.docs[0];
+        await doc.ref.delete();
+        log(`🗑️ Documento Firestore eliminado: ${doc.id}`);
+        manager.notifyFileChange('deleted', path.basename(filePath), doc.id);
+      }
+      
+      // Borrar del Storage
+      const file = bucket.file(remotePath);
+      const [exists] = await file.exists();
+      if (exists) {
+        await file.delete();
+        log(`🗑️ Archivo Storage eliminado: ${remotePath}`);
+      }
+    } catch (err) {
+      log(`❌ Error propagando borrado: ${err.message}`);
+    }
+  });
 
   log(`Escuchando cambios en ${SYNC_DIR}`);
+  log(`🔄 Sincronización bidireccional activa`);
+
+  // Ejecutar sync cycle inicial
+  await manager.syncCycle();
 
   setInterval(() => {
     manager.syncCycle();
