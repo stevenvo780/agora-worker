@@ -218,13 +218,31 @@ class SyncManager {
         .where("storagePath", "==", remotePath)
         .limit(1)
         .get();
-      snapshot.forEach((doc) => {
-        doc.ref.update({
+      
+      if (snapshot.empty) {
+        // Crear nuevo documento en Firestore si no existe
+        const fileName = path.basename(localPath);
+        const docData = {
+          name: fileName.replace(/\.[^/.]+$/, ""), // nombre sin extensión
           content,
+          storagePath: remotePath,
+          workspaceId: tokenInfo.workspaceId,
+          ownerId: tokenInfo.userId || tokenInfo.workspaceId,
+          folder: "No estructurado",
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        };
+        const newDoc = await this.db.collection("documents").add(docData);
+        log(`Firestore documento creado: ${newDoc.id} (${fileName})`);
+      } else {
+        snapshot.forEach((doc) => {
+          doc.ref.update({
+            content,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          log(`Firestore actualizado: ${doc.id}`);
         });
-        log(`Firestore actualizado: ${doc.id}`);
-      });
+      }
     } catch (err) {
       log(`Error sincronizando Firestore: ${err.message}`);
     }
