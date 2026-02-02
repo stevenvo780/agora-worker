@@ -158,7 +158,8 @@ class SyncManager {
     this.downloadsInFlight = new Set();
     this.cycleInProgress = false;
     this.firestoreUnsubscribe = null;
-    this.knownRemoteFiles = new Set(); // Tracking de archivos remotos conocidos
+    this.knownLocalFiles = new Set(); // Archivos que sabemos que existen localmente
+    this.initialSyncDone = false; // Indica si ya se hizo el sync inicial
 
     this.mounts.push({
       local: SYNC_DIR,
@@ -170,6 +171,21 @@ class SyncManager {
     } else {
       log(`🔹 Modo Workspace: Sincronizando ${tokenInfo.storagePath}`);
     }
+  }
+
+  // Registrar que conocemos un archivo local
+  trackLocalFile(localPath) {
+    this.knownLocalFiles.add(localPath);
+  }
+
+  // Verificar si un archivo estaba conocido localmente (fue borrado intencionalmente)
+  wasKnownLocally(localPath) {
+    return this.knownLocalFiles.has(localPath);
+  }
+
+  // Eliminar del tracking cuando se borra
+  untrackLocalFile(localPath) {
+    this.knownLocalFiles.delete(localPath);
   }
 
   // Marcar que un cambio local está en progreso (evita loops)
@@ -216,6 +232,9 @@ class SyncManager {
   setupFirestoreListener() {
     log(`🔔 Configurando listener de Firestore para ${tokenInfo.workspaceId}...`);
     
+    // Flag para ignorar el snapshot inicial (todos los docs aparecen como 'added')
+    let isInitialSnapshot = true;
+    
     // Query para documentos de este workspace
     let query;
     if (tokenInfo.workspaceType === 'personal') {
@@ -228,6 +247,13 @@ class SyncManager {
 
     this.firestoreUnsubscribe = query.onSnapshot(
       (snapshot) => {
+        // Ignorar el snapshot inicial - el syncCycle se encargará de la sincronización inicial
+        if (isInitialSnapshot) {
+          isInitialSnapshot = false;
+          log(`📋 Snapshot inicial ignorado (${snapshot.size} documentos)`);
+          return;
+        }
+        
         snapshot.docChanges().forEach(async (change) => {
           const doc = change.doc;
           const data = doc.data();
@@ -245,9 +271,11 @@ class SyncManager {
 
           if (change.type === 'added' || change.type === 'modified') {
             // Descargar/actualizar archivo desde Firebase
+            log(`📨 Firestore: ${change.type} ${data.name || doc.id}`);
             await this.syncDocumentToLocal(data, localPath);
           } else if (change.type === 'removed') {
             // Borrar archivo local cuando se borra de Firebase
+            log(`📨 Firestore: removed ${data.name || doc.id}`);
             await this.deleteLocalFile(localPath, data.name || doc.id);
           }
         });
@@ -478,6 +506,7 @@ class SyncManager {
 
       log(`Descargado: ${path.basename(localPath)}`);
       this.recentDownloads.set(localPath, Date.now());
+      this.trackLocalFile(localPath); // Registrar que este archivo existe localmente
     } catch (err) {
       log(`Error descargando ${file.name}: ${err.message}`);
     } finally {
@@ -504,8 +533,10 @@ class SyncManager {
   async syncCycle() {
     if (this.cycleInProgress) return;
     this.cycleInProgress = true;
+    log(`🔄 Iniciando ciclo de sincronización...`);
     try {
       for (const mount of this.mounts) {
+        log(`📂 Procesando mount: ${mount.local} -> ${mount.remote}`);
         // Get remote files from Storage
         const [remoteFiles] = await this.bucket.getFiles({
           prefix: `${mount.remote}/`,
@@ -545,23 +576,45 @@ class SyncManager {
           const remotePath = this.getRemotePath(localPath);
           if (!remotePath) continue;
           
-          // Verificar si el archivo fue borrado de Firestore (para archivos de texto)
           const ext = path.extname(localPath).toLowerCase();
-          if (TEXT_EXTS.has(ext) && !firestorePathSet.has(remotePath)) {
-            // El archivo existe localmente pero fue borrado de Firestore
-            // Borrarlo localmente también
-            log(`🗑️ Detectado archivo borrado de Firestore: ${path.basename(localPath)}`);
-            await this.deleteLocalFile(localPath, path.basename(localPath));
-            continue;
-          }
+          const isTextFile = TEXT_EXTS.has(ext);
+          const existsInFirestore = firestorePathSet.has(remotePath);
+          const existsInStorage = remotePathSet.has(remotePath);
           
-          if (!remotePathSet.has(remotePath)) {
-            // File exists locally but not in Firebase Storage - upload it
-            await this.uploadFile(localPath);
+          // Para archivos de TEXTO:
+          // - Firestore es la fuente de verdad
+          // - Si no existe en Firestore, borrarlo localmente (fue eliminado desde UI)
+          // - Solo subir si es un archivo NUEVO (no existe en Firestore ni en Storage)
+          if (isTextFile) {
+            if (!existsInFirestore && existsInStorage) {
+              // Archivo fue borrado de Firestore pero aún existe en Storage
+              // Borrar localmente, PART 2 limpiará Storage
+              log(`🗑️ Borrando archivo local (borrado de Firestore): ${path.basename(localPath)}`);
+              await this.deleteLocalFile(localPath, path.basename(localPath));
+              continue;
+            }
+            
+            if (!existsInFirestore && !existsInStorage) {
+              // Archivo nuevo creado localmente - subirlo
+              await this.uploadFile(localPath);
+              continue;
+            }
+            
+            // Si existe en Firestore, sincronizar normalmente
+            if (existsInFirestore && !existsInStorage) {
+              await this.uploadFile(localPath);
+            }
+          } else {
+            // Para archivos NO de texto (binarios), subir si no existe en Storage
+            if (!existsInStorage) {
+              await this.uploadFile(localPath);
+            }
           }
         }
 
         // PART 2: Process remote files (download new ones, sync existing)
+        // IMPORTANTE: Solo descargar archivos que existen en Firestore
+        // Si un archivo existe en Storage pero no en Firestore, NO descargarlo
         for (const file of remoteFiles) {
           if (file.name.endsWith("/")) continue;
 
@@ -569,10 +622,64 @@ class SyncManager {
           if (!localPath) continue;
           if (isIgnoredPath(localPath)) continue;
 
-          if (!fs.existsSync(localPath)) {
+          // Verificar si el archivo existe en Firestore antes de descargarlo
+          const ext = path.extname(localPath).toLowerCase();
+          if (TEXT_EXTS.has(ext) && !firestorePathSet.has(file.name)) {
+            // El archivo existe en Storage pero NO en Firestore
+            // No descargarlo - probablemente fue borrado desde la UI
+            // También borrarlo de Storage para limpiar
+            log(`🧹 Archivo huérfano en Storage (no en Firestore): ${path.basename(localPath)}`);
+            try {
+              await file.delete();
+              log(`🗑️ Eliminado de Storage: ${file.name}`);
+            } catch (err) {
+              log(`⚠️ Error eliminando de Storage: ${err.message}`);
+            }
+            continue;
+          }
+
+          const localExists = fs.existsSync(localPath);
+          
+          if (!localExists) {
+            // El archivo no existe localmente
+            // ¿Fue borrado intencionalmente desde el worker?
+            if (this.initialSyncDone && this.wasKnownLocally(localPath)) {
+              // Sí, el archivo existía antes y ahora no está
+              // Propagar el borrado a Firebase
+              log(`🗑️ Detectado borrado local de: ${path.basename(localPath)}`);
+              this.untrackLocalFile(localPath);
+              
+              // Buscar y borrar el documento de Firestore
+              const snapshot = await this.db
+                .collection("documents")
+                .where("storagePath", "==", file.name)
+                .limit(1)
+                .get();
+              
+              if (!snapshot.empty) {
+                const doc = snapshot.docs[0];
+                await doc.ref.delete();
+                log(`🗑️ Documento Firestore eliminado: ${doc.id}`);
+                this.notifyFileChange('deleted', path.basename(localPath), doc.id);
+              }
+              
+              // Borrar del Storage
+              try {
+                await file.delete();
+                log(`🗑️ Archivo Storage eliminado: ${file.name}`);
+              } catch (err) {
+                log(`⚠️ Error eliminando de Storage: ${err.message}`);
+              }
+              continue;
+            }
+            
+            // Es un archivo nuevo que aún no se ha descargado
             await this.downloadFile(file);
             continue;
           }
+          
+          // El archivo existe localmente, registrarlo si no lo hemos hecho
+          this.trackLocalFile(localPath);
 
           const localStat = fs.statSync(localPath);
           const localMtimeMs = localStat.mtimeMs;
@@ -602,27 +709,21 @@ class SyncManager {
 
           await this.downloadFile(file);
         }
-
-        // PART 3: Detectar archivos que existen en Storage pero no en Firestore (huérfanos)
-        // y archivos borrados de Storage que aún existen localmente
-        for (const localPath of localFiles) {
-          const remotePath = this.getRemotePath(localPath);
-          if (!remotePath) continue;
-          
-          // Si no existe en Storage ni en Firestore, borrar localmente
-          if (!remotePathSet.has(remotePath) && !firestorePathSet.has(remotePath)) {
-            const ext = path.extname(localPath).toLowerCase();
-            // Solo borrar si es un archivo de texto rastreado
-            if (TEXT_EXTS.has(ext)) {
-              log(`🗑️ Archivo huérfano detectado, borrando: ${path.basename(localPath)}`);
-              await this.deleteLocalFile(localPath, path.basename(localPath));
-            }
-          }
+        
+        // Marcar que el sync inicial ha terminado
+        if (!this.initialSyncDone) {
+          this.initialSyncDone = true;
+          log(`✅ Sincronización inicial completada - borrados locales ahora se propagarán`);
         }
+
+        // PART 3 eliminada - la limpieza de huérfanos ahora se hace en PART 2
+        // El listener de Firestore se encarga de borrar archivos locales cuando se borran de Firestore
       }
     } catch (err) {
-      log(`Error en sync cycle: ${err.message}`);
+      log(`❌ Error en sync cycle: ${err.message}`);
+      console.error(err.stack);
     } finally {
+      log(`✅ Ciclo de sincronización completado`);
       this.cycleInProgress = false;
     }
   }
