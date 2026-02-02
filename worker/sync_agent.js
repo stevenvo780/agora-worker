@@ -419,18 +419,25 @@ class SyncManager {
       if (snapshot.empty) {
         // Crear nuevo documento en Firestore si no existe
         const fileName = path.basename(localPath);
+        
+        // Calcular el folder basado en la estructura de directorios
+        const relPath = path.relative(SYNC_DIR, localPath);
+        const dirPath = path.dirname(relPath);
+        // Si está en la raíz, usar "No estructurado", sino usar el path de directorio
+        const folder = (dirPath === '.' || dirPath === '') ? 'No estructurado' : dirPath.split(path.sep).join('/');
+        
         const docData = {
           name: fileName.replace(/\.[^/.]+$/, ""), // nombre sin extensión
           content,
           storagePath: remotePath,
           workspaceId: tokenInfo.workspaceId,
           ownerId: tokenInfo.userId || tokenInfo.workspaceId,
-          folder: "No estructurado",
+          folder: folder,
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         };
         const newDoc = await this.db.collection("documents").add(docData);
-        log(`Firestore documento creado: ${newDoc.id} (${fileName})`);
+        log(`Firestore documento creado: ${newDoc.id} (${fileName}) en carpeta: ${folder}`);
         this.notifyFileChange('created', fileName, newDoc.id);
       } else {
         snapshot.forEach((doc) => {
