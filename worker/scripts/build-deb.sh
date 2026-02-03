@@ -41,6 +41,13 @@ Description: Worker local para Educacion Cooperativa
  Este servicio ejecuta workers en Docker para espacios de trabajo.
  Soporta multiples workspaces con edu-worker-manager.
  Cada workspace tiene su propio contenedor aislado.
+ .
+ Compatibilidad verificada:
+ - Ubuntu 20.04 LTS (Focal)
+ - Ubuntu 22.04 LTS (Jammy)
+ - Ubuntu 24.04 LTS (Noble)
+ - Debian 11 (Bullseye)
+ - Debian 12 (Bookworm)
 EOF
 
 cat > "$BUILD_DIR/DEBIAN/conffiles" << EOF

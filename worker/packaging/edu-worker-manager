@@ -99,6 +99,7 @@ cmd_add() {
     local workspace_id=""
     local display_name=""
     local workspace_type="shared"
+    local auto_start=true
     
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -112,6 +113,10 @@ cmd_add() {
                 ;;
             --personal)
                 workspace_type="personal"
+                shift
+                ;;
+            --no-start)
+                auto_start=false
                 shift
                 ;;
             -*)
@@ -159,7 +164,13 @@ EOF
     echo "   Config: ${config_file}"
     echo "   Mount:  ${mount_path}"
     echo ""
-    echo "Run 'edu-worker-manager start ${workspace_id}' to start the worker"
+    
+    if [ "$auto_start" = true ]; then
+        echo "🚀 Auto-starting worker..."
+        start_worker "$workspace_id"
+    else
+        echo "Run 'edu-worker-manager start ${workspace_id}' to start the worker"
+    fi
 }
 
 cmd_remove() {
