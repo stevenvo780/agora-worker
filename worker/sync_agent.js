@@ -15,7 +15,7 @@ const POLL_INTERVAL_MS = (() => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 30000;
 })();
 const CLOCK_SKEW_MS = 2000;
-const DOWNLOAD_GRACE_MS = 3000;
+const DOWNLOAD_GRACE_MS = 15000; // Aumentado a 15s para dar margen al polling de Chokidar (5s) + latencia
 
 function parseToken(token) {
   if (token.startsWith('personal:')) {
@@ -160,6 +160,7 @@ class SyncManager {
     this.firestoreUnsubscribe = null;
     this.knownLocalFiles = new Set(); // Archivos que sabemos que existen localmente
     this.initialSyncDone = false; // Indica si ya se hizo el sync inicial
+    this.isShuttingDown = false; // Flag de apagado
 
     this.mounts.push({
       local: SYNC_DIR,
@@ -455,6 +456,7 @@ class SyncManager {
   }
 
   async uploadFile(localPath) {
+    if (this.isShuttingDown) return;
     if (this.inFlight.has(localPath)) return;
     if (isIgnoredPath(localPath)) return;
     if (!fs.existsSync(localPath) || !fs.statSync(localPath).isFile()) return;
@@ -495,6 +497,7 @@ class SyncManager {
   }
 
   async downloadFile(file) {
+    if (this.isShuttingDown) return;
     if (this.downloadsInFlight.has(file.name)) return;
     this.downloadsInFlight.add(file.name);
     try {
@@ -538,7 +541,7 @@ class SyncManager {
   }
 
   async syncCycle() {
-    if (this.cycleInProgress) return;
+    if (this.cycleInProgress || this.isShuttingDown) return;
     this.cycleInProgress = true;
     log(`🔄 Iniciando ciclo de sincronización...`);
     try {
@@ -590,14 +593,16 @@ class SyncManager {
           
           // Para archivos de TEXTO:
           // - Firestore es la fuente de verdad
-          // - Si no existe en Firestore, borrarlo localmente (fue eliminado desde UI)
-          // - Solo subir si es un archivo NUEVO (no existe en Firestore ni en Storage)
+          // - Si no existe en Firestore, per verificar si existe localmente
+          //   -> Si existe local y storage pero no firestore: RECUPERAR (Safety First)
+          //   -> Si no existe local: Borrar de storage (limpieza)
           if (isTextFile) {
             if (!existsInFirestore && existsInStorage) {
-              // Archivo fue borrado de Firestore pero aún existe en Storage
-              // Borrar localmente, PART 2 limpiará Storage
-              log(`🗑️ Borrando archivo local (borrado de Firestore): ${path.basename(localPath)}`);
-              await this.deleteLocalFile(localPath, path.basename(localPath));
+              // CONFLICTO: Existe en Storage y Local, pero no en Firestore.
+              // Estrategia segura: Asumir que Firestore perdió el dato y RECREARLO.
+              // Esto evita que un fallo de red o inconsistencia borre archivos locales válidos.
+              log(`⚠️ Conflicto detectado: Archivo en Local/Storage pero no en Firestore. Reparando Firestore: ${path.basename(localPath)}`);
+              await this.updateFirestore(remotePath, localPath);
               continue;
             }
             
@@ -734,6 +739,40 @@ class SyncManager {
       this.cycleInProgress = false;
     }
   }
+
+  async shutdown() {
+    this.isShuttingDown = true;
+    log('🛑 Iniciando apagado seguro. Esperando operaciones pendientes...');
+    
+    // Si hay ciclo en progreso, esperar a que termine (o timeout)
+    // No podemos cancelar promesas, así que confiamos en que los chequeos de isShuttingDown paren nuevas acciones
+    
+    const MAX_WAIT = 30000; // 30 segundos máximo
+    const START = Date.now();
+    
+    while (this.inFlight.size > 0 || this.downloadsInFlight.size > 0 || this.cycleInProgress) {
+      const elapsed = Date.now() - START;
+      if (elapsed > MAX_WAIT) {
+        log('⚠️ Tiempo de espera agotado. Forzando cierre.');
+        break;
+      }
+      
+      log(`⏳ Pendientes: ${this.inFlight.size} uploads, ${this.downloadsInFlight.size} downloads. Ciclo activo: ${this.cycleInProgress}`);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    
+    if (this.firestoreUnsubscribe) {
+        this.firestoreUnsubscribe();
+        log('✅ Listener Firestore desconectado');
+    }
+    
+    if (this.socket) {
+        this.socket.disconnect();
+        log('✅ Socket desconectado');
+    }
+    
+    log('👋 Apagado completado.');
+  }
 }
 
 async function run() {
@@ -788,6 +827,11 @@ async function run() {
     usePolling: true,
     interval: 5000,
     binaryInterval: 10000,
+    depth: 99, // Aumentar profundidad explícita
+    awaitWriteFinish: {
+      stabilityThreshold: 2000,
+      pollInterval: 100
+    }
   });
 
   watcher.on("add", (filePath) => manager.uploadFile(filePath));
@@ -836,6 +880,18 @@ async function run() {
   setInterval(() => {
     manager.syncCycle();
   }, POLL_INTERVAL_MS);
+
+  // Manejo de señales para apagado seguro
+  const handleSignal = async (signal) => {
+    log(`\n🛑 Recibida señal ${signal}`);
+    await watcher.close();
+    log('✅ Watcher detenido');
+    await manager.shutdown();
+    process.exit(0);
+  };
+
+  process.on('SIGTERM', () => handleSignal('SIGTERM'));
+  process.on('SIGINT', () => handleSignal('SIGINT'));
 }
 
 run().catch((err) => {
