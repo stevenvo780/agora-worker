@@ -59,6 +59,9 @@ cat > "$BUILD_DIR/DEBIAN/postinst" << 'EOF'
 #!/bin/bash
 set -e
 
+# Remove legacy scripts that may conflict with PATH priority
+rm -f /usr/local/bin/edu-worker-manager 2>/dev/null || true
+
 # Get actual user (not root during sudo install)
 ACTUAL_USER="${SUDO_USER:-$USER}"
 ACTUAL_HOME=$(getent passwd "$ACTUAL_USER" | cut -d: -f6)
@@ -68,9 +71,13 @@ mkdir -p /etc/edu-worker/workers.d
 mkdir -p "$ACTUAL_HOME/edu-worker/workspaces"
 chown -R "$ACTUAL_USER:$ACTUAL_USER" "$ACTUAL_HOME/edu-worker"
 
-# Set BASE_MOUNT_PATH in worker.env
-if grep -q "^BASE_MOUNT_PATH=$" /etc/edu-worker/worker.env 2>/dev/null; then
-  sed -i "s|^BASE_MOUNT_PATH=$|BASE_MOUNT_PATH=$ACTUAL_HOME/edu-worker|g" /etc/edu-worker/worker.env
+# Always set BASE_MOUNT_PATH to the correct user's home
+if [ -f /etc/edu-worker/worker.env ]; then
+  if grep -q "^BASE_MOUNT_PATH=" /etc/edu-worker/worker.env; then
+    sed -i "s|^BASE_MOUNT_PATH=.*|BASE_MOUNT_PATH=$ACTUAL_HOME/edu-worker|g" /etc/edu-worker/worker.env
+  else
+    echo "BASE_MOUNT_PATH=$ACTUAL_HOME/edu-worker" >> /etc/edu-worker/worker.env
+  fi
 fi
 
 if command -v systemctl >/dev/null 2>&1; then
