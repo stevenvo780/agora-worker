@@ -23,6 +23,7 @@ const FIREBASE_CONFIG = process.env.FIREBASE_CONFIG
   : { storageBucket: process.env.FIREBASE_BUCKET || "udea-filosofia.firebasestorage.app" };
 
 const SYNC_DIR = "/workspace";
+const WORKER_SECRET = process.env.WORKER_SECRET || "";
 const POLL_INTERVAL_MS = (() => {
   const raw = process.env.SYNC_POLL_MS;
   const parsed = raw ? Number(raw) : 30000;
@@ -721,7 +722,8 @@ async function run() {
   const socket = io(NEXUS_URL, {
     auth: {
       type: "sync-agent",
-      workerToken: WORKER_TOKEN
+      workerToken: WORKER_TOKEN,
+      secret: WORKER_SECRET
     },
     transports: ['websocket'],
     reconnection: true,
