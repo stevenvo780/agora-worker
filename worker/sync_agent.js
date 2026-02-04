@@ -135,8 +135,8 @@ function md5Base64(filePath) {
 }
 
 class SyncManager {
-  constructor(bucket, db, socket) {
-    this.bucket = bucket;
+  constructor(storage, db, socket) {
+    this.storage = storage;
     this.db = db;
     this.socket = socket;
     this.mounts = [];
@@ -276,9 +276,21 @@ class SyncManager {
     log(`✅ Listener de Firestore activo`);
   }
 
+  // Asegurar que existe la estructura de directorios para un path
+  ensureDirectoryExists(filePath) {
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+      log(`📁 Directorio creado: ${path.relative(SYNC_DIR, dir)}`);
+    }
+  }
+
   // Sincronizar un documento de Firestore al archivo local
   async syncDocumentToLocal(docData, localPath) {
     try {
+      // Asegurar que existe la estructura de directorios (subcarpetas)
+      this.ensureDirectoryExists(localPath);
+      
       // Para archivos de texto, usar el contenido de Firestore
       const ext = path.extname(localPath).toLowerCase();
       if (TEXT_EXTS.has(ext) && docData.content !== undefined) {
@@ -290,21 +302,19 @@ class SyncManager {
           }
         }
         
-        // Crear directorio si no existe
-        fs.mkdirSync(path.dirname(localPath), { recursive: true });
-        
         // Escribir contenido
         fs.writeFileSync(localPath, docData.content, 'utf8');
         this.recentDownloads.set(localPath, Date.now());
+        this.trackLocalFile(localPath);
         log(`📥 Sincronizado desde Firestore: ${docData.name || path.basename(localPath)}`);
       } else {
         // Para archivos binarios, descargar de Storage
         const fileRef = ref(this.storage, docData.storagePath);
         try {
           const buffer = await getBytes(fileRef);
-          fs.mkdirSync(path.dirname(localPath), { recursive: true });
           fs.writeFileSync(localPath, Buffer.from(buffer));
           this.recentDownloads.set(localPath, Date.now());
+          this.trackLocalFile(localPath);
           log(`📥 Descargado desde Storage: ${docData.name || path.basename(localPath)}`);
         } catch (err) {
           if (err.code !== 'storage/object-not-found') {
@@ -322,24 +332,32 @@ class SyncManager {
     try {
       if (fs.existsSync(localPath)) {
         fs.unlinkSync(localPath);
+        this.untrackLocalFile(localPath);
         log(`🗑️ Archivo local eliminado: ${fileName}`);
         
-        // Limpiar directorio padre si está vacío
-        const parentDir = path.dirname(localPath);
-        if (parentDir !== SYNC_DIR) {
-          try {
-            const files = fs.readdirSync(parentDir);
-            if (files.length === 0) {
-              fs.rmdirSync(parentDir);
-              log(`🗑️ Directorio vacío eliminado: ${path.basename(parentDir)}`);
-            }
-          } catch (_err) {
-            // Ignorar errores al limpiar directorios
-          }
-        }
+        // Limpiar directorios padres vacíos recursivamente
+        this.cleanupEmptyParentDirs(path.dirname(localPath));
       }
     } catch (err) {
       log(`❌ Error eliminando archivo local: ${err.message}`);
+    }
+  }
+
+  // Limpiar directorios vacíos recursivamente hacia arriba
+  cleanupEmptyParentDirs(dir) {
+    if (dir === SYNC_DIR || !dir.startsWith(SYNC_DIR)) return;
+    
+    try {
+      const files = fs.readdirSync(dir);
+      if (files.length === 0) {
+        fs.rmdirSync(dir);
+        const relPath = path.relative(SYNC_DIR, dir);
+        log(`🗑️ Directorio vacío eliminado: ${relPath}`);
+        // Recursivamente limpiar el padre
+        this.cleanupEmptyParentDirs(path.dirname(dir));
+      }
+    } catch (_err) {
+      // Ignorar errores al limpiar directorios
     }
   }
 
@@ -522,20 +540,48 @@ class SyncManager {
     }
   }
 
-  // Recursively scan local directory for files
-  scanLocalFiles(dir, fileList = []) {
-    if (!fs.existsSync(dir)) return fileList;
+  // Recursively scan local directory for files and directories
+  scanLocalFiles(dir, fileList = [], dirList = []) {
+    if (!fs.existsSync(dir)) return { files: fileList, dirs: dirList };
     const entries = fs.readdirSync(dir, { withFileTypes: true });
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
       if (isIgnoredPath(fullPath)) continue;
       if (entry.isDirectory()) {
-        this.scanLocalFiles(fullPath, fileList);
+        dirList.push(fullPath);
+        this.scanLocalFiles(fullPath, fileList, dirList);
       } else if (entry.isFile()) {
         fileList.push(fullPath);
       }
     }
-    return fileList;
+    return { files: fileList, dirs: dirList };
+  }
+
+  // Obtener la estructura de carpetas desde Firestore (basada en el campo folder)
+  async getFirestoreFolders() {
+    const folders = new Set();
+    let q;
+    if (tokenInfo.workspaceType === 'personal') {
+      q = query(collection(this.db, 'documents'), where('ownerId', '==', tokenInfo.userId));
+    } else {
+      q = query(collection(this.db, 'documents'), where('workspaceId', '==', tokenInfo.workspaceId));
+    }
+    
+    const snapshot = await getDocs(q);
+    snapshot.forEach(docSnap => {
+      const data = docSnap.data();
+      if (data.folder && data.folder !== 'No estructurado') {
+        // Agregar la carpeta y todas sus carpetas padre
+        const parts = data.folder.split('/');
+        let accumulated = '';
+        for (const part of parts) {
+          accumulated = accumulated ? `${accumulated}/${part}` : part;
+          folders.add(accumulated);
+        }
+      }
+    });
+    
+    return folders;
   }
 
   async listRemoteFilesRecursive(folderRef, files = []) {
@@ -608,8 +654,22 @@ class SyncManager {
             if (data.storagePath) firestorePathSet.add(data.storagePath);
         });
 
-        // PART 1: Scan local files
-        const localFiles = this.scanLocalFiles(mount.local);
+        // PART 0: Sincronizar estructura de carpetas desde Firestore
+        const firestoreFolders = await this.getFirestoreFolders();
+        for (const folder of firestoreFolders) {
+          const localDir = path.join(mount.local, folder);
+          if (!fs.existsSync(localDir)) {
+            fs.mkdirSync(localDir, { recursive: true });
+            log(`📁 Carpeta sincronizada desde Firestore: ${folder}`);
+          }
+        }
+
+        // PART 1: Scan local files and directories
+        const { files: localFiles, dirs: localDirs } = this.scanLocalFiles(mount.local);
+        
+        if (localDirs.length > 0) {
+          log(`📁 Encontrados ${localDirs.length} directorios locales`);
+        }
         
         for (const localPath of localFiles) {
           const remotePath = this.getRemotePath(localPath);
@@ -781,6 +841,18 @@ async function run() {
       watcher.on("add", (fp) => manager.uploadFile(fp));
       watcher.on("change", (fp) => manager.uploadFile(fp));
       watcher.on("unlink", (fp) => manager.handleLocalDelete(fp));
+      watcher.on("addDir", (fp) => {
+        if (fp !== SYNC_DIR && !isIgnoredPath(fp)) {
+          const relPath = path.relative(SYNC_DIR, fp);
+          log(`📁 Nueva carpeta detectada: ${relPath}`);
+        }
+      });
+      watcher.on("unlinkDir", (fp) => {
+        if (fp !== SYNC_DIR && !isIgnoredPath(fp)) {
+          const relPath = path.relative(SYNC_DIR, fp);
+          log(`🗑️ Carpeta eliminada: ${relPath}`);
+        }
+      });
 
       log(`Escuchando cambios en ${SYNC_DIR}`);
 

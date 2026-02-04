@@ -225,10 +225,9 @@ start_worker() {
     args+=(-v "${MOUNT_PATH}:/workspace")
     args+=(--restart unless-stopped)
     
-    # Mount Firebase service account file if exists
-    if [ -f "$SERVICE_ACCOUNT_PATH" ]; then
-        args+=(-v "${SERVICE_ACCOUNT_PATH}:/app/serviceAccountKey.json:ro")
-        args+=(-e "GOOGLE_APPLICATION_CREDENTIALS=/app/serviceAccountKey.json")
+    # Firebase config for client SDK (public config, not admin credentials)
+    if [ -n "${FIREBASE_CONFIG:-}" ]; then
+        args+=(-e "FIREBASE_CONFIG=$FIREBASE_CONFIG")
     fi
     
     if [ -n "${FIREBASE_BUCKET:-}" ]; then

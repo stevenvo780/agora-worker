@@ -1,6 +1,6 @@
 {
   "name": "simple-worker",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "type": "module",
   "scripts": {
     "deb": "bash scripts/build-deb.sh",
@@ -8,6 +8,7 @@
     "lint": "eslint \"*.js\""
   },
   "dependencies": {
+    "@dataconnect/generated": "file:src/dataconnect-generated",
     "chokidar": "^3.6.0",
     "firebase": "^10.8.0",
     "node-pty": "^1.0.0",

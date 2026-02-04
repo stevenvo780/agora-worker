@@ -1,22 +1,32 @@
 #!/bin/bash
 set -e
 
-# Check for Firebase credentials
-# Priority: GOOGLE_APPLICATION_CREDENTIALS env var (mounted file)
-CREDS_FILE="${GOOGLE_APPLICATION_CREDENTIALS:-/app/serviceAccountKey.json}"
+# Sync Agent Authentication:
+# - Worker connects to Hub with signed HMAC token (WORKER_SECRET)
+# - Hub verifies and issues Firebase Custom Token
+# - No serviceAccountKey.json needed in workers (secure architecture)
 
-if [ -f "$CREDS_FILE" ]; then
-    echo "🔑 Using Firebase credentials from: $CREDS_FILE"
-    export GOOGLE_APPLICATION_CREDENTIALS="$CREDS_FILE"
-    
-    # Start Sync Service in background
-    echo "Starting Sync Service..."
-    node /app/sync_agent.js > /var/log/sync_agent.log 2>&1 &
+echo "🚀 Starting Edu Worker..."
+echo "🔌 Worker Configuration:"
+echo "   Hub URL: ${NEXUS_URL:-http://localhost:3010}"
+echo "   Token: ${WORKER_TOKEN:-<not set>}"
+
+# Determine workspace type from token
+if [[ "$WORKER_TOKEN" == personal:* ]]; then
+    echo "   Type: personal"
+    echo "   Workspace ID: $WORKER_TOKEN"
 else
-    echo "⚠️  No Firebase credentials found. Skipping Sync Service."
-    echo "   Expected at: $CREDS_FILE"
+    echo "   Type: shared"
+    echo "   Workspace ID: $WORKER_TOKEN"
 fi
 
-# Start Node Worker
-echo "🚀 Starting Edu Worker..."
+# Start Sync Agent in background (auth via Hub Custom Token)
+if [ -n "$WORKER_SECRET" ] && [ -n "$WORKER_TOKEN" ]; then
+    echo "📡 Starting Sync Agent..."
+    node /app/sync_agent.js 2>&1 | tee /var/log/sync_agent.log &
+else
+    echo "⚠️  WORKER_SECRET or WORKER_TOKEN not set. Sync Agent disabled."
+fi
+
+# Start main Worker process
 exec node /app/index.js
