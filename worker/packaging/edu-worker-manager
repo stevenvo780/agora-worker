@@ -221,6 +221,7 @@ start_worker() {
     local args=(run -d --name "$container_name" --network=host)
     args+=(-e "NEXUS_URL=$NEXUS_URL")
     args+=(-e "WORKER_TOKEN=$WORKER_TOKEN")
+    args+=(-e "WORKER_SECRET=$WORKER_SECRET")
     args+=(-v "${MOUNT_PATH}:/workspace")
     args+=(--restart unless-stopped)
     
