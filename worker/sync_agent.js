@@ -679,6 +679,7 @@ class SyncManager {
       await this.updateFirestore(remotePath, localPath);
     } catch (err) {
       if (err && (err.code === "storage/unauthorized" || err.code === "storage/unauthenticated")) {
+        log(`⛔ Upload bloqueado: ${path.basename(localPath)} - ${err.code} - ${err.message}`);
         blockUpload(localPath, "reglas de Storage");
         return;
       }
