@@ -1,0 +1,11 @@
+node_modules
+dist
+build
+.git
+.DS_Store
+*.md
+workers-data
+packaging
+scripts
+coverage
+test-results

@@ -6,11 +6,11 @@ import { initializeApp } from "firebase/app";
 import { getAuth, signInWithCustomToken } from "firebase/auth";
 import { 
   getFirestore, collection, query, where, onSnapshot, 
-  doc, getDoc, getDocs, addDoc, updateDoc, deleteDoc, 
-  serverTimestamp, Timestamp 
+  getDocs, addDoc, updateDoc, deleteDoc, 
+  serverTimestamp 
 } from "firebase/firestore";
 import { 
-  getStorage, ref, uploadBytes, getDownloadURL, 
+  getStorage, ref, uploadBytes, 
   getMetadata, deleteObject, getBytes, listAll 
 } from "firebase/storage";
 import { io } from "socket.io-client";
@@ -74,9 +74,6 @@ function log(message) {
   console.log(`${ts} - ${message}`);
 }
 
-function readJsonFile(filePath) {
-  return JSON.parse(fs.readFileSync(filePath, "utf8"));
-}
 
 // Inicialización de Firebase Client SDK
 const app = initializeApp(FIREBASE_CONFIG);
@@ -667,7 +664,9 @@ class SyncManager {
              const metadata = await getMetadata(fileRef);
              const updatedStr = metadata.updated;
              remoteUpdatedMs = updatedStr ? new Date(updatedStr).getTime() : 0;
-          } catch(e) {}
+          } catch(e) {
+            // Ignore metadata error
+          }
 
           if (!remoteUpdatedMs) {
             await this.downloadFile(fileRef);

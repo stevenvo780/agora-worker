@@ -44,6 +44,10 @@ if [ -n "$FIREBASE_BUCKET" ]; then
   args+=(-e "FIREBASE_BUCKET=$FIREBASE_BUCKET")
 fi
 
+if [ -n "${FIREBASE_CONFIG:-}" ]; then
+  args+=(-e "FIREBASE_CONFIG=$FIREBASE_CONFIG")
+fi
+
 if [ -n "${FIREBASE_SERVICE_ACCOUNT:-}" ]; then
   args+=(-e "FIREBASE_SERVICE_ACCOUNT=$FIREBASE_SERVICE_ACCOUNT")
 fi
