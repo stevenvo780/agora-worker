@@ -52,15 +52,18 @@ function generateSignedToken(token, secret) {
 
 function parseToken(token) {
   if (token.startsWith('personal:')) {
+    const userId = token.substring('personal:'.length);
     return {
-      workspaceId: token,
+      workspaceId: token,              // Token completo para identificación interna
+      firestoreWorkspaceId: 'personal', // Para guardar en Firestore (consistente con frontend)
       workspaceType: 'personal',
-      userId: token.substring('personal:'.length),
-      storagePath: `users/${token.substring('personal:'.length)}`
+      userId: userId,
+      storagePath: `users/${userId}`
     };
   }
   return {
     workspaceId: token,
+    firestoreWorkspaceId: token,       // Para shared es el mismo
     workspaceType: 'shared',
     userId: null,
     storagePath: `workspaces/${token}`
@@ -440,8 +443,8 @@ class SyncManager {
           name: fileName.replace(/\.[^/.]+$/, ""), // nombre sin extensión
           content,
           storagePath: remotePath,
-          workspaceId: tokenInfo.workspaceId,
-          ownerId: tokenInfo.userId || tokenInfo.workspaceId,
+          workspaceId: tokenInfo.firestoreWorkspaceId,
+          ownerId: tokenInfo.userId || tokenInfo.firestoreWorkspaceId,
           folder: folder,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
