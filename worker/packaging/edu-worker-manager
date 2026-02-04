@@ -150,6 +150,18 @@ start_worker() {
   local _FIREBASE_CONFIG="$FIREBASE_CONFIG"
   local _FIREBASE_BUCKET="$FIREBASE_BUCKET"
   
+  # Validate critical variables
+  if [ -z "$_WORKER_SECRET" ]; then
+    echo "❌ ERROR: WORKER_SECRET not set in /etc/edu-worker/worker.env"
+    echo "   Run this command with sudo, or check your configuration."
+    return 1
+  fi
+  if [ -z "$_FIREBASE_CONFIG" ]; then
+    echo "❌ ERROR: FIREBASE_CONFIG not set in /etc/edu-worker/worker.env"
+    echo "   Run this command with sudo, or check your configuration."
+    return 1
+  fi
+  
   source "$config_file"
   local container_name=$(get_container_name "$workspace_id")
 
@@ -158,8 +170,8 @@ start_worker() {
   local args=(run -d --name "$container_name" --network=host --restart unless-stopped)
   args+=(-e "NEXUS_URL=$NEXUS_URL")
   args+=(-e "WORKER_TOKEN=$WORKER_TOKEN")
-  [ -n "$_WORKER_SECRET" ] && args+=(-e "WORKER_SECRET=$_WORKER_SECRET")
-  [ -n "$_FIREBASE_CONFIG" ] && args+=(-e "FIREBASE_CONFIG=$_FIREBASE_CONFIG")
+  args+=(-e "WORKER_SECRET=$_WORKER_SECRET")
+  args+=(-e "FIREBASE_CONFIG=$_FIREBASE_CONFIG")
   [ -n "$_FIREBASE_BUCKET" ] && args+=(-e "FIREBASE_BUCKET=$_FIREBASE_BUCKET")
   args+=(-v "${MOUNT_PATH}:/workspace")
 
