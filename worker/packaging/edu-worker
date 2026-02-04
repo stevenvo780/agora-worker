@@ -1,32 +1,34 @@
 #!/usr/bin/env bash
+# edu-worker: Start a single worker container
+# DEPRECATED: Use edu-worker-manager for multi-worker management
 set -euo pipefail
 
 ENV_FILE="${ENV_FILE:-/etc/edu-worker/worker.env}"
 if [ -f "$ENV_FILE" ]; then
   set -a
-  . "$ENV_FILE"
+  source "$ENV_FILE"
   set +a
 fi
 
 if ! command -v docker >/dev/null 2>&1; then
-  echo "docker no esta instalado o no esta en PATH" >&2
+  echo "docker not installed" >&2
   exit 1
 fi
 
 WORKER_TOKEN="${WORKER_TOKEN:-}"
 if [ -z "$WORKER_TOKEN" ]; then
-  echo "WORKER_TOKEN es requerido" >&2
+  echo "WORKER_TOKEN required" >&2
   exit 1
 fi
 
 NEXUS_URL="${NEXUS_URL:-http://localhost:3010}"
 MOUNT_PATH="${MOUNT_PATH:-/var/lib/edu-worker/workspace}"
-SERVICE_ACCOUNT_PATH="${SERVICE_ACCOUNT_PATH:-/etc/edu-worker/serviceAccountKey.json}"
 FIREBASE_BUCKET="${FIREBASE_BUCKET:-}"
+FIREBASE_CONFIG="${FIREBASE_CONFIG:-}"
+WORKER_SECRET="${WORKER_SECRET:-}"
 WORKER_IMAGE="${WORKER_IMAGE:-stevenvo780/edu-worker:latest}"
 CONTAINER_NAME="${CONTAINER_NAME:-edu-worker}"
 AUTO_PULL="${AUTO_PULL:-0}"
-WORKSPACE_DIR_PREFIX="${WORKSPACE_DIR_PREFIX:-_ws}"
 
 mkdir -p "$MOUNT_PATH"
 
@@ -37,31 +39,21 @@ fi
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 
 args=(run --rm --name "$CONTAINER_NAME" --network=host)
-args+=(--env-file "$ENV_FILE")
-args+=(-e "WORKSPACE_DIR_PREFIX=$WORKSPACE_DIR_PREFIX")
-# ...existing code...
+args+=(-e "NEXUS_URL=$NEXUS_URL")
+args+=(-e "WORKER_TOKEN=$WORKER_TOKEN")
 
+if [ -n "$WORKER_SECRET" ]; then
+  args+=(-e "WORKER_SECRET=$WORKER_SECRET")
+fi
+
+if [ -n "$FIREBASE_CONFIG" ]; then
+  args+=(-e "FIREBASE_CONFIG=$FIREBASE_CONFIG")
+fi
 
 if [ -n "$FIREBASE_BUCKET" ]; then
   args+=(-e "FIREBASE_BUCKET=$FIREBASE_BUCKET")
 fi
 
-
-
-if [ -n "${WORKER_SECRET:-}" ]; then
-  args+=(-e "WORKER_SECRET=$WORKER_SECRET")
-fi
-
-
-if [ -n "${FIREBASE_SERVICE_ACCOUNT:-}" ]; then
-  args+=(-e "FIREBASE_SERVICE_ACCOUNT=$FIREBASE_SERVICE_ACCOUNT")
-fi
-
 args+=(-v "$MOUNT_PATH:/workspace")
-
-if [ -f "$SERVICE_ACCOUNT_PATH" ]; then
-  args+=(-v "$SERVICE_ACCOUNT_PATH:/app/credentials/serviceAccountKey.json:ro")
-  args+=(-e "GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/serviceAccountKey.json")
-fi
 
 exec docker "${args[@]}" "$WORKER_IMAGE"

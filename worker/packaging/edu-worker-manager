@@ -1,401 +1,265 @@
 #!/usr/bin/env bash
-# edu-worker-manager: Manage multiple workspace workers
+# edu-worker-manager: Manage workspace workers as Docker containers
 set -euo pipefail
 
-# Load global config if exists
-if [ -f /etc/edu-worker/worker.env ]; then
-    source /etc/edu-worker/worker.env
+# Load global config
+CONFIG_FILE="/etc/edu-worker/worker.env"
+if [ -f "$CONFIG_FILE" ]; then
+  set -a
+  source "$CONFIG_FILE"
+  set +a
 fi
 
+# Configuration with defaults
 WORKERS_CONFIG_DIR="${WORKERS_CONFIG_DIR:-/etc/edu-worker/workers.d}"
-BASE_MOUNT_PATH="${BASE_MOUNT_PATH:-/var/lib/edu-worker}"
-SERVICE_ACCOUNT_PATH="${SERVICE_ACCOUNT_PATH:-/etc/edu-worker/serviceAccountKey.json}"
+BASE_MOUNT_PATH="${BASE_MOUNT_PATH:-/home/humanizar/edu-worker}"
 WORKER_IMAGE="${WORKER_IMAGE:-stevenvo780/edu-worker:latest}"
 NEXUS_URL="${NEXUS_URL:-http://148.230.88.162:3010}"
+WORKER_SECRET="${WORKER_SECRET:-}"
+FIREBASE_CONFIG="${FIREBASE_CONFIG:-}"
+FIREBASE_BUCKET="${FIREBASE_BUCKET:-}"
 
 usage() {
-    cat <<EOF
+  cat <<EOF
+edu-worker-manager - Manage workspace workers
+
 Usage: edu-worker-manager <command> [options]
 
 Commands:
-  add <workspace-id> [--name <display-name>] [--type <personal|shared>]
-      Add a new workspace worker configuration
-      
-  remove <workspace-id>
-      Remove a workspace worker configuration and stop its container
-      
-  start <workspace-id|all>
-      Start a specific workspace worker or all configured workers
-      
-  stop <workspace-id|all>
-      Stop a specific workspace worker or all workers
-      
-  restart <workspace-id|all>
-      Restart a specific workspace worker or all workers
-      
-  status [workspace-id]
-      Show status of all workers or a specific one
-      
-  list
-      List all configured workspace workers
-      
-  logs <workspace-id> [--follow]
-      Show logs for a specific workspace worker
+  add <workspace-id> [--name <name>] [--personal]
+      Add and start a new workspace worker
 
-Options:
-  --name <name>      Display name for the workspace (default: workspace-id)
-  --type <type>      Workspace type: personal or shared (default: shared)
-  --personal         Shortcut for --type personal
-  
+  remove <workspace-id>
+      Stop and remove a workspace worker
+
+  start <workspace-id|all>
+      Start worker(s)
+
+  stop <workspace-id|all>
+      Stop worker(s)
+
+  restart <workspace-id|all>
+      Restart worker(s)
+
+  status [workspace-id]
+      Show worker status
+
+  logs <workspace-id> [-f]
+      Show worker logs
+
+  update [workspace-id|all]
+      Pull latest image and restart worker(s)
+
 Examples:
-  # Add a personal workspace worker
-  edu-worker-manager add myuserid123 --type personal
-  
-  # Add a shared workspace worker
-  edu-worker-manager add Vt9HeKsMtdYGGRBUHOwP --name "Griego"
-  
-  # Start all workers
+  edu-worker-manager add myuserid --personal
+  edu-worker-manager add Vt9HeKs --name "Griego"
   edu-worker-manager start all
-  
-  # Check status
-  edu-worker-manager status
+  edu-worker-manager update all
 
 EOF
-    exit 1
+  exit 1
 }
 
 ensure_dirs() {
-    mkdir -p "$WORKERS_CONFIG_DIR"
-    mkdir -p "$BASE_MOUNT_PATH"
+  mkdir -p "$WORKERS_CONFIG_DIR"
+  mkdir -p "$BASE_MOUNT_PATH/workspaces"
 }
 
 get_container_name() {
-    local workspace_id="$1"
-    # Sanitize workspace ID for container name (replace : with -)
-    echo "edu-worker-${workspace_id}" | tr ':' '-' | tr -cd '[:alnum:]-_' | head -c 63
+  local id="$1"
+  echo "edu-worker-${id}" | tr ':' '-' | tr -cd '[:alnum:]-_' | head -c 63
 }
 
-# Sanitize workspace ID for file paths (replace : with _)
 get_safe_path() {
-    local workspace_id="$1"
-    echo "${workspace_id}" | tr ':' '_'
+  echo "$1" | tr ':' '_'
 }
 
 get_worker_token() {
-    local workspace_id="$1"
-    local workspace_type="$2"
-    
-    # Si el workspace_id ya empieza con "personal:", usarlo directamente
-    if [[ "$workspace_id" == personal:* ]]; then
-        echo "${workspace_id}"
-    elif [ "$workspace_type" = "personal" ]; then
-        echo "personal:${workspace_id}"
-    else
-        echo "${workspace_id}"
-    fi
+  local id="$1"
+  local type="$2"
+  if [[ "$id" == personal:* ]]; then
+    echo "$id"
+  elif [ "$type" = "personal" ]; then
+    echo "personal:$id"
+  else
+    echo "$id"
+  fi
 }
 
 cmd_add() {
-    local workspace_id=""
-    local display_name=""
-    local workspace_type="shared"
-    local auto_start=true
-    
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --name)
-                display_name="$2"
-                shift 2
-                ;;
-            --type)
-                workspace_type="$2"
-                shift 2
-                ;;
-            --personal)
-                workspace_type="personal"
-                shift
-                ;;
-            --no-start)
-                auto_start=false
-                shift
-                ;;
-            -*)
-                echo "Unknown option: $1" >&2
-                usage
-                ;;
-            *)
-                if [ -z "$workspace_id" ]; then
-                    workspace_id="$1"
-                fi
-                shift
-                ;;
-        esac
-    done
-    
-    if [ -z "$workspace_id" ]; then
-        echo "Error: workspace-id is required" >&2
-        usage
-    fi
-    
-    if [ -z "$display_name" ]; then
-        display_name="$workspace_id"
-    fi
-    
-    ensure_dirs
-    
-    local safe_id=$(get_safe_path "$workspace_id")
-    local config_file="${WORKERS_CONFIG_DIR}/${safe_id}.conf"
-    local mount_path="${BASE_MOUNT_PATH}/workspaces/${safe_id}"
-    
-    mkdir -p "$mount_path"
-    
-    cat > "$config_file" <<EOF
-# Worker configuration for workspace: ${display_name}
-# Created: $(date -Iseconds)
+  local workspace_id=""
+  local display_name=""
+  local workspace_type="shared"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name) display_name="$2"; shift 2 ;;
+      --personal) workspace_type="personal"; shift ;;
+      --type) workspace_type="$2"; shift 2 ;;
+      -*) echo "Unknown option: $1" >&2; usage ;;
+      *) [ -z "$workspace_id" ] && workspace_id="$1"; shift ;;
+    esac
+  done
+
+  [ -z "$workspace_id" ] && { echo "Error: workspace-id required" >&2; usage; }
+  [ -z "$display_name" ] && display_name="$workspace_id"
+
+  ensure_dirs
+
+  local safe_id=$(get_safe_path "$workspace_id")
+  local config_file="${WORKERS_CONFIG_DIR}/${safe_id}.conf"
+  local mount_path="${BASE_MOUNT_PATH}/workspaces/${safe_id}"
+
+  mkdir -p "$mount_path"
+
+  cat > "$config_file" <<EOF
 WORKSPACE_ID="${workspace_id}"
 WORKSPACE_NAME="${display_name}"
 WORKSPACE_TYPE="${workspace_type}"
 WORKER_TOKEN="$(get_worker_token "$workspace_id" "$workspace_type")"
 MOUNT_PATH="${mount_path}"
-FIREBASE_BUCKET="${FIREBASE_BUCKET:-}"
 EOF
 
-    echo "✅ Added workspace worker: ${display_name} (${workspace_id})"
-    echo "   Config: ${config_file}"
-    echo "   Mount:  ${mount_path}"
-    echo ""
-    
-    if [ "$auto_start" = true ]; then
-        echo "🚀 Auto-starting worker..."
-        start_worker "$workspace_id"
-    else
-        echo "Run 'edu-worker-manager start ${workspace_id}' to start the worker"
-    fi
+  echo "✅ Added: ${display_name} (${workspace_id})"
+  start_worker "$workspace_id"
 }
 
 cmd_remove() {
-    local workspace_id="$1"
-    
-    if [ -z "$workspace_id" ]; then
-        echo "Error: workspace-id is required" >&2
-        usage
-    fi
-    
-    local safe_id=$(get_safe_path "$workspace_id")
-    local config_file="${WORKERS_CONFIG_DIR}/${safe_id}.conf"
-    local container_name=$(get_container_name "$workspace_id")
-    
-    # Stop the container if running
-    docker stop "$container_name" 2>/dev/null || true
-    docker rm -f "$container_name" 2>/dev/null || true
-    
-    # Remove config file
-    if [ -f "$config_file" ]; then
-        rm -f "$config_file"
-        echo "✅ Removed workspace worker: ${workspace_id}"
-    else
-        echo "⚠️  Config not found for workspace: ${workspace_id}"
-    fi
+  local workspace_id="$1"
+  [ -z "$workspace_id" ] && { echo "Error: workspace-id required" >&2; usage; }
+
+  local safe_id=$(get_safe_path "$workspace_id")
+  local config_file="${WORKERS_CONFIG_DIR}/${safe_id}.conf"
+  local container_name=$(get_container_name "$workspace_id")
+
+  docker stop "$container_name" 2>/dev/null || true
+  docker rm -f "$container_name" 2>/dev/null || true
+
+  [ -f "$config_file" ] && rm -f "$config_file" && echo "✅ Removed: ${workspace_id}"
 }
 
 start_worker() {
-    local workspace_id="$1"
-    local safe_id=$(get_safe_path "$workspace_id")
-    local config_file="${WORKERS_CONFIG_DIR}/${safe_id}.conf"
-    
-    if [ ! -f "$config_file" ]; then
-        echo "❌ Config not found for workspace: ${workspace_id}"
-        return 1
-    fi
-    
-    # Load config
-    source "$config_file"
-    
-    local container_name=$(get_container_name "$workspace_id")
-    
-    # Stop if already running
-    docker stop "$container_name" 2>/dev/null || true
-    docker rm -f "$container_name" 2>/dev/null || true
-    
-    # Build docker run arguments
-    local args=(run -d --name "$container_name" --network=host)
-    args+=(-e "NEXUS_URL=$NEXUS_URL")
-    args+=(-e "WORKER_TOKEN=$WORKER_TOKEN")
-    args+=(-e "WORKER_SECRET=$WORKER_SECRET")
-    args+=(-v "${MOUNT_PATH}:/workspace")
-    args+=(--restart unless-stopped)
-    
-    # Firebase config for client SDK (public config, not admin credentials)
-    if [ -n "${FIREBASE_CONFIG:-}" ]; then
-        args+=(-e "FIREBASE_CONFIG=$FIREBASE_CONFIG")
-    fi
-    
-    if [ -n "${FIREBASE_BUCKET:-}" ]; then
-        args+=(-e "FIREBASE_BUCKET=$FIREBASE_BUCKET")
-    fi
-    
-    docker "${args[@]}" "$WORKER_IMAGE"
-    
-    echo "✅ Started worker for: ${WORKSPACE_NAME:-$workspace_id}"
+  local workspace_id="$1"
+  local safe_id=$(get_safe_path "$workspace_id")
+  local config_file="${WORKERS_CONFIG_DIR}/${safe_id}.conf"
+
+  [ ! -f "$config_file" ] && { echo "❌ Config not found: $workspace_id"; return 1; }
+
+  source "$config_file"
+  local container_name=$(get_container_name "$workspace_id")
+
+  docker rm -f "$container_name" 2>/dev/null || true
+
+  local args=(run -d --name "$container_name" --network=host --restart unless-stopped)
+  args+=(-e "NEXUS_URL=$NEXUS_URL")
+  args+=(-e "WORKER_TOKEN=$WORKER_TOKEN")
+  [ -n "$WORKER_SECRET" ] && args+=(-e "WORKER_SECRET=$WORKER_SECRET")
+  [ -n "$FIREBASE_CONFIG" ] && args+=(-e "FIREBASE_CONFIG=$FIREBASE_CONFIG")
+  [ -n "$FIREBASE_BUCKET" ] && args+=(-e "FIREBASE_BUCKET=$FIREBASE_BUCKET")
+  args+=(-v "${MOUNT_PATH}:/workspace")
+
+  docker "${args[@]}" "$WORKER_IMAGE" >/dev/null
+  echo "✅ Started: ${WORKSPACE_NAME:-$workspace_id}"
 }
 
 cmd_start() {
-    local target="$1"
-    
-    if [ -z "$target" ]; then
-        echo "Error: workspace-id or 'all' is required" >&2
-        usage
-    fi
-    
-    ensure_dirs
-    
-    if [ "$target" = "all" ]; then
-        local count=0
-        for config in "${WORKERS_CONFIG_DIR}"/*.conf; do
-            [ -f "$config" ] || continue
-            local ws_id=$(basename "$config" .conf)
-            start_worker "$ws_id" && ((count++)) || true
-        done
-        echo ""
-        echo "Started ${count} worker(s)"
-    else
-        start_worker "$target"
-    fi
+  local target="${1:-}"
+  [ -z "$target" ] && { echo "Error: workspace-id or 'all' required" >&2; usage; }
+
+  ensure_dirs
+
+  if [ "$target" = "all" ]; then
+    local count=0
+    for conf in "${WORKERS_CONFIG_DIR}"/*.conf; do
+      [ -f "$conf" ] || continue
+      start_worker "$(basename "$conf" .conf)" && ((count++)) || true
+    done
+    echo "Started $count worker(s)"
+  else
+    start_worker "$target"
+  fi
 }
 
 cmd_stop() {
-    local target="$1"
-    
-    if [ -z "$target" ]; then
-        echo "Error: workspace-id or 'all' is required" >&2
-        usage
-    fi
-    
-    if [ "$target" = "all" ]; then
-        for config in "${WORKERS_CONFIG_DIR}"/*.conf; do
-            [ -f "$config" ] || continue
-            source "$config"
-            local real_ws_id="${WORKSPACE_ID:-$(basename "$config" .conf)}"
-            local container_name=$(get_container_name "$real_ws_id")
-            docker stop "$container_name" 2>/dev/null && echo "Stopped: $real_ws_id" || true
-        done
-    else
-        local container_name=$(get_container_name "$target")
-        docker stop "$container_name" 2>/dev/null && echo "Stopped: $target" || echo "Not running: $target"
-    fi
+  local target="${1:-}"
+  [ -z "$target" ] && { echo "Error: workspace-id or 'all' required" >&2; usage; }
+
+  if [ "$target" = "all" ]; then
+    for conf in "${WORKERS_CONFIG_DIR}"/*.conf; do
+      [ -f "$conf" ] || continue
+      source "$conf"
+      local container_name=$(get_container_name "${WORKSPACE_ID:-$(basename "$conf" .conf)}")
+      docker stop "$container_name" 2>/dev/null && echo "Stopped: $WORKSPACE_ID" || true
+    done
+  else
+    docker stop "$(get_container_name "$target")" 2>/dev/null && echo "Stopped: $target" || echo "Not running: $target"
+  fi
 }
 
 cmd_restart() {
-    local target="$1"
-    cmd_stop "$target"
-    sleep 1
-    cmd_start "$target"
+  cmd_stop "${1:-}"
+  sleep 1
+  cmd_start "${1:-}"
+}
+
+cmd_update() {
+  local target="${1:-all}"
+  echo "Pulling latest image..."
+  docker pull "$WORKER_IMAGE"
+  cmd_restart "$target"
 }
 
 cmd_status() {
-    local target="${1:-}"
-    
-    ensure_dirs
-    
-    printf "%-25s %-15s %-10s %-20s\n" "WORKSPACE" "TYPE" "STATUS" "CONTAINER"
-    printf "%-25s %-15s %-10s %-20s\n" "-------------------------" "---------------" "----------" "--------------------"
-    
-    for config in "${WORKERS_CONFIG_DIR}"/*.conf; do
-        [ -f "$config" ] || continue
-        
-        source "$config"
-        # Use WORKSPACE_ID from config (has original : chars) for container name
-        local real_ws_id="${WORKSPACE_ID:-$(basename "$config" .conf)}"
-        local safe_ws_id=$(basename "$config" .conf)
-        
-        if [ -n "$target" ] && [ "$target" != "$real_ws_id" ] && [ "$target" != "$safe_ws_id" ]; then
-            continue
-        fi
-        
-        local container_name=$(get_container_name "$real_ws_id")
-        local status="stopped"
-        
-        if docker ps --format '{{.Names}}' | grep -q "^${container_name}$"; then
-            status="running"
-        fi
-        
-        local display="${WORKSPACE_NAME:-$real_ws_id}"
-        if [ ${#display} -gt 23 ]; then
-            display="${display:0:20}..."
-        fi
-        
-        printf "%-25s %-15s %-10s %-20s\n" "$display" "${WORKSPACE_TYPE:-shared}" "$status" "$container_name"
-    done
-}
+  ensure_dirs
+  printf "%-30s %-10s %-10s %-8s\n" "WORKSPACE" "TYPE" "STATUS" "RTDB"
+  printf "%-30s %-10s %-10s %-8s\n" "------------------------------" "----------" "----------" "--------"
 
-cmd_list() {
-    cmd_status
+  for conf in "${WORKERS_CONFIG_DIR}"/*.conf; do
+    [ -f "$conf" ] || continue
+    source "$conf"
+    local ws_id="${WORKSPACE_ID:-$(basename "$conf" .conf)}"
+    local container_name=$(get_container_name "$ws_id")
+    local status="stopped"
+    local rtdb="-"
+
+    if docker ps --format '{{.Names}}' | grep -q "^${container_name}$"; then
+      status="running"
+      rtdb=$(docker logs "$container_name" 2>&1 | grep -c "✅ Listener de RTDB activo" || echo 0)
+    fi
+
+    local name="${WORKSPACE_NAME:-$ws_id}"
+    [ ${#name} -gt 28 ] && name="${name:0:25}..."
+    printf "%-30s %-10s %-10s %-8s\n" "$name" "${WORKSPACE_TYPE:-shared}" "$status" "$rtdb"
+  done
 }
 
 cmd_logs() {
-    local workspace_id="$1"
-    shift || true
-    local follow=""
-    
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --follow|-f)
-                follow="-f"
-                shift
-                ;;
-            *)
-                shift
-                ;;
-        esac
-    done
-    
-    if [ -z "$workspace_id" ]; then
-        echo "Error: workspace-id is required" >&2
-        usage
-    fi
-    
-    local container_name=$(get_container_name "$workspace_id")
-    docker logs $follow "$container_name"
+  local workspace_id="$1"; shift || true
+  local follow=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--follow) follow="-f"; shift ;;
+      *) shift ;;
+    esac
+  done
+  [ -z "$workspace_id" ] && { echo "Error: workspace-id required" >&2; usage; }
+  docker logs $follow "$(get_container_name "$workspace_id")"
 }
-
+        
 # Main
-if [ $# -lt 1 ]; then
-    usage
-fi
+[ $# -lt 1 ] && usage
 
-command="$1"
-shift
+cmd="$1"; shift
 
-case "$command" in
-    add)
-        cmd_add "$@"
-        ;;
-    remove|rm|delete)
-        cmd_remove "${1:-}"
-        ;;
-    start)
-        cmd_start "${1:-}"
-        ;;
-    stop)
-        cmd_stop "${1:-}"
-        ;;
-    restart)
-        cmd_restart "${1:-}"
-        ;;
-    status)
-        cmd_status "${1:-}"
-        ;;
-    list|ls)
-        cmd_list
-        ;;
-    logs)
-        cmd_logs "$@"
-        ;;
-    help|--help|-h)
-        usage
-        ;;
-    *)
-        echo "Unknown command: $command" >&2
-        usage
-        ;;
+case "$cmd" in
+  add) cmd_add "$@" ;;
+  remove|rm) cmd_remove "${1:-}" ;;
+  start) cmd_start "${1:-}" ;;
+  stop) cmd_stop "${1:-}" ;;
+  restart) cmd_restart "${1:-}" ;;
+  update) cmd_update "${1:-}" ;;
+  status|list|ls) cmd_status ;;
+  logs) cmd_logs "$@" ;;
+  help|--help|-h) usage ;;
+  *) echo "Unknown command: $cmd" >&2; usage ;;
 esac

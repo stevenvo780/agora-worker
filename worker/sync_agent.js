@@ -13,14 +13,26 @@ import {
   getStorage, ref, uploadBytes, 
   getMetadata, deleteObject, getBytes, listAll 
 } from "firebase/storage";
+import { 
+  getDatabase, ref as rtdbRef, push, set, onChildAdded, 
+  serverTimestamp as rtdbServerTimestamp, off, remove, query as rtdbQuery, 
+  orderByChild, startAt, onValue
+} from "firebase/database";
 import { io } from "socket.io-client";
 
 const WORKER_TOKEN = process.env.WORKER_TOKEN || "";
 const NEXUS_URL = process.env.NEXUS_URL || "http://localhost:3010";
 // Configuración de Firebase debe venir por variable de entorno JSON
-const FIREBASE_CONFIG = process.env.FIREBASE_CONFIG 
-  ? JSON.parse(process.env.FIREBASE_CONFIG) 
-  : { storageBucket: process.env.FIREBASE_BUCKET || "udea-filosofia.firebasestorage.app" };
+const FIREBASE_CONFIG = (() => {
+  const config = process.env.FIREBASE_CONFIG
+    ? JSON.parse(process.env.FIREBASE_CONFIG)
+    : { storageBucket: process.env.FIREBASE_BUCKET || "udea-filosofia.firebasestorage.app" };
+  // Asegurar que tiene databaseURL para RTDB
+  if (!config.databaseURL && config.projectId) {
+    config.databaseURL = `https://${config.projectId}-default-rtdb.firebaseio.com`;
+  }
+  return config;
+})();
 
 const SYNC_DIR = "/workspace";
 const WORKER_SECRET = process.env.WORKER_SECRET || "";
@@ -80,16 +92,42 @@ if (!WORKER_TOKEN) {
 }
 
 const IGNORE_LIST = new Set([".git", ".DS_Store", "node_modules", ".next"]);
-const TEXT_EXTS = new Set([
+const ALLOWED_TEXT_EXTS = new Set([
   ".md",
   ".txt",
-  ".js",
-  ".ts",
-  ".tsx",
   ".json",
-  ".css",
+  ".xml",
+  ".yaml",
+  ".yml",
+  ".toml",
+  ".csv",
   ".html",
+  ".css",
+  ".scss",
+  ".less",
+  ".ini",
+  ".log",
 ]);
+
+const CONTENT_TYPE_BY_EXT = new Map([
+  [".md", "text/markdown"],
+  [".txt", "text/plain"],
+  [".json", "application/json"],
+  [".xml", "application/xml"],
+  [".yaml", "application/yaml"],
+  [".yml", "application/x-yaml"],
+  [".toml", "application/toml"],
+  [".csv", "text/csv"],
+  [".html", "text/html"],
+  [".css", "text/css"],
+  [".scss", "text/x-scss"],
+  [".less", "text/x-less"],
+  [".ini", "text/plain"],
+  [".log", "text/plain"],
+]);
+
+const BLOCKED_UPLOAD_TTL_MS = 10 * 60 * 1000;
+const blockedUploads = new Map();
 
 function log(message) {
   const ts = new Date().toISOString();
@@ -103,6 +141,12 @@ const app = initializeApp(FIREBASE_CONFIG);
 const auth = getAuth(app);
 const db = getFirestore(app);
 const storage = getStorage(app);
+const rtdb = getDatabase(app);
+
+// Path de eventos RTDB para este workspace
+const RTDB_SYNC_PATH = tokenInfo.workspaceType === 'personal' 
+  ? `sync-events/personal_${tokenInfo.userId}`
+  : `sync-events/${tokenInfo.workspaceId}`;
 
 
 function toPosixPath(localPath) {
@@ -127,6 +171,36 @@ function isIgnoredPath(filePath) {
   return false;
 }
 
+function getExtLower(filePath) {
+  return path.extname(filePath).toLowerCase();
+}
+
+function isAllowedTextExtension(ext) {
+  return ALLOWED_TEXT_EXTS.has(ext);
+}
+
+function getContentTypeForExt(ext) {
+  return CONTENT_TYPE_BY_EXT.get(ext) || "text/plain";
+}
+
+function isUploadBlocked(localPath) {
+  const entry = blockedUploads.get(localPath);
+  if (!entry) return false;
+  if (Date.now() - entry.ts > BLOCKED_UPLOAD_TTL_MS) {
+    blockedUploads.delete(localPath);
+    return false;
+  }
+  return true;
+}
+
+function blockUpload(localPath, reason) {
+  if (!blockedUploads.has(localPath)) {
+    const rel = path.relative(SYNC_DIR, localPath);
+    log(`Bloqueado upload (${reason}): ${rel}`);
+  }
+  blockedUploads.set(localPath, { ts: Date.now(), reason });
+}
+
 function md5Base64(filePath) {
   return new Promise((resolve, reject) => {
     const hash = crypto.createHash("md5");
@@ -138,10 +212,11 @@ function md5Base64(filePath) {
 }
 
 class SyncManager {
-  constructor(storage, db, socket) {
+  constructor(storage, db, socket, rtdb) {
     this.storage = storage;
     this.db = db;
     this.socket = socket;
+    this.rtdb = rtdb;
     this.mounts = [];
     this.recentDownloads = new Map();
     this.recentLocalChanges = new Map(); // Para evitar loops: local -> firebase -> local
@@ -149,9 +224,11 @@ class SyncManager {
     this.downloadsInFlight = new Set();
     this.cycleInProgress = false;
     this.firestoreUnsubscribe = null;
+    this.rtdbUnsubscribe = null; // Listener de RTDB
     this.knownLocalFiles = new Set(); // Archivos que sabemos que existen localmente
     this.initialSyncDone = false; // Indica si ya se hizo el sync inicial
     this.isShuttingDown = false; // Flag de apagado
+    this.lastEventTime = Date.now(); // Para filtrar eventos antiguos
 
     this.mounts.push({
       local: SYNC_DIR,
@@ -201,18 +278,104 @@ class SyncManager {
     return this.recentLocalChanges.has(localPath);
   }
 
-  // Notificar al Hub que hubo un cambio de documentos
-  notifyFileChange(action, fileName, docId = null) {
+  // Publicar evento a RTDB para notificar cambios en tiempo real
+  async publishSyncEvent(action, fileName, docId = null, folder = null) {
+    try {
+      const eventsRef = rtdbRef(this.rtdb, RTDB_SYNC_PATH);
+      const eventData = {
+        type: action, // 'created', 'updated', 'deleted'
+        path: fileName,
+        folder: folder || 'No estructurado',
+        docId: docId,
+        timestamp: Date.now(),
+        source: 'worker' // Para distinguir origen
+      };
+      await push(eventsRef, eventData);
+      log(`📡 RTDB: ${action} ${fileName}`);
+    } catch (err) {
+      log(`⚠️ Error publicando a RTDB: ${err.message}`);
+      // Fallback a socket si RTDB falla
+      this.notifyViaSocket(action, fileName, docId);
+    }
+  }
+
+  // Fallback: Notificar al Hub via socket
+  notifyViaSocket(action, fileName, docId = null) {
     if (this.socket && this.socket.connected) {
       this.socket.emit('doc-change', {
         workspaceId: tokenInfo.workspaceId,
-        action, // 'created', 'updated', 'deleted'
+        action,
         docId,
-        data: {
-          name: fileName
-        }
+        data: { name: fileName }
       });
-      log(`📡 Notificado: ${action} ${fileName}`);
+    }
+  }
+
+  // Alias para compatibilidad
+  notifyFileChange(action, fileName, docId = null, folder = null) {
+    this.publishSyncEvent(action, fileName, docId, folder);
+  }
+
+  // Configurar listener de RTDB para eventos del frontend
+  setupRTDBListener() {
+    log(`🔔 Configurando listener de RTDB para eventos del frontend...`);
+    
+    const eventsRef = rtdbRef(this.rtdb, RTDB_SYNC_PATH);
+    // Solo escuchar eventos nuevos (después del tiempo de inicio)
+    const startTime = this.lastEventTime;
+    
+    this.rtdbUnsubscribe = onChildAdded(eventsRef, async (snapshot) => {
+      const event = snapshot.val();
+      if (!event || event.timestamp < startTime) return;
+      
+      // Ignorar eventos propios (del worker)
+      if (event.source === 'worker') return;
+      
+      log(`📨 RTDB evento del frontend: ${event.type} ${event.path}`);
+      
+      // Procesar evento según tipo
+      if (event.type === 'refresh') {
+        // Frontend solicita refresh completo
+        await this.syncCycle();
+      } else if (event.type === 'created' || event.type === 'updated') {
+        // Frontend creó/actualizó un documento - descargar a local
+        if (event.docId) {
+          await this.downloadDocumentById(event.docId);
+        }
+      } else if (event.type === 'deleted') {
+        // Frontend borró un documento - eliminar local
+        const localPath = path.join(SYNC_DIR, event.folder || '', event.path);
+        if (fs.existsSync(localPath)) {
+          fs.unlinkSync(localPath);
+          log(`🗑️ Archivo eliminado por evento RTDB: ${event.path}`);
+        }
+      }
+      
+      // Limpiar evento procesado (opcional, para no acumular)
+      try {
+        await remove(snapshot.ref);
+      } catch (_e) { /* ignore */ }
+    });
+    
+    log(`✅ Listener de RTDB activo`);
+  }
+
+  // Descargar documento específico por ID
+  async downloadDocumentById(docId) {
+    try {
+      const docsRef = collection(this.db, "documents");
+      const docSnapshot = await getDocs(query(docsRef, where("__name__", "==", docId)));
+      if (docSnapshot.empty) return;
+      
+      const data = docSnapshot.docs[0].data();
+      if (!data.storagePath) return;
+      
+      const localPath = this.getLocalPath(data.storagePath);
+      if (!localPath) return;
+      
+      await this.syncDocumentToLocal(data, localPath);
+    } catch (err) {
+      log(`⚠️ Error descargando documento ${docId}: ${err.message}`);
     }
   }
 
@@ -295,8 +458,12 @@ class SyncManager {
       this.ensureDirectoryExists(localPath);
       
       // Para archivos de texto, usar el contenido de Firestore
-      const ext = path.extname(localPath).toLowerCase();
-      if (TEXT_EXTS.has(ext) && docData.content !== undefined) {
+      const ext = getExtLower(localPath);
+      if (!isAllowedTextExtension(ext)) {
+        log(`Omitido (extension no permitida): ${docData.name || path.basename(localPath)}`);
+        return;
+      }
+      if (docData.content !== undefined) {
         // Verificar si el contenido local es diferente
         if (fs.existsSync(localPath)) {
           const localContent = fs.readFileSync(localPath, 'utf8');
@@ -310,18 +477,19 @@ class SyncManager {
         this.recentDownloads.set(localPath, Date.now());
         this.trackLocalFile(localPath);
         log(`📥 Sincronizado desde Firestore: ${docData.name || path.basename(localPath)}`);
-      } else {
-        // Para archivos binarios, descargar de Storage
+      }
+      // Fallback: si no hay contenido en Firestore, descargar de Storage
+      if (docData.content === undefined) {
         const fileRef = ref(this.storage, docData.storagePath);
         try {
           const buffer = await getBytes(fileRef);
           fs.writeFileSync(localPath, Buffer.from(buffer));
           this.recentDownloads.set(localPath, Date.now());
           this.trackLocalFile(localPath);
-          log(`📥 Descargado desde Storage: ${docData.name || path.basename(localPath)}`);
+          log(`Descargado desde Storage: ${docData.name || path.basename(localPath)}`);
         } catch (err) {
           if (err.code !== 'storage/object-not-found') {
-             throw err;
+            throw err;
           }
         }
       }
@@ -416,9 +584,8 @@ class SyncManager {
 
   async updateFirestore(remotePath, localPath) {
     try {
-      if (!TEXT_EXTS.has(path.extname(localPath).toLowerCase())) {
-        // Para archivos no-texto, solo notificar el cambio
-        this.notifyFileChange('updated', path.basename(localPath));
+      const ext = getExtLower(localPath);
+      if (!isAllowedTextExtension(ext)) {
         return;
       }
       const content = fs.readFileSync(localPath, "utf8");
@@ -471,12 +638,19 @@ class SyncManager {
     if (this.isShuttingDown) return;
     if (this.inFlight.has(localPath)) return;
     if (isIgnoredPath(localPath)) return;
+    if (isUploadBlocked(localPath)) return;
     if (!fs.existsSync(localPath) || !fs.statSync(localPath).isFile()) return;
     this.cleanupRecentDownloads();
     if (this.recentDownloads.has(localPath)) return;
 
     const remotePath = this.getRemotePath(localPath);
     if (!remotePath) return;
+    
+    const ext = getExtLower(localPath);
+    if (!isAllowedTextExtension(ext)) {
+      blockUpload(localPath, "extension no permitida");
+      return;
+    }
 
     // Marcar como cambio local para evitar que el listener lo procese de vuelta
     this.markLocalChange(localPath);
@@ -499,10 +673,15 @@ class SyncManager {
       }
 
       const content = fs.readFileSync(localPath);
-      await uploadBytes(fileRef, content);
-      log(`Subido: ${path.basename(localPath)}`);
+      const contentType = getContentTypeForExt(ext);
+      await uploadBytes(fileRef, content, { contentType });
+      log(`Subido: ${path.basename(localPath)} (${contentType})`);
       await this.updateFirestore(remotePath, localPath);
     } catch (err) {
+      if (err && (err.code === "storage/unauthorized" || err.code === "storage/unauthenticated")) {
+        blockUpload(localPath, "reglas de Storage");
+        return;
+      }
       log(`Error subiendo ${localPath}: ${err.message}`);
     } finally {
       this.inFlight.delete(localPath);
@@ -678,28 +857,26 @@ class SyncManager {
           const remotePath = this.getRemotePath(localPath);
           if (!remotePath) continue;
           
-          const ext = path.extname(localPath).toLowerCase();
-          const isTextFile = TEXT_EXTS.has(ext);
+          const ext = getExtLower(localPath);
+          const isTextFile = isAllowedTextExtension(ext);
           const existsInFirestore = firestorePathSet.has(remotePath);
           const existsInStorage = remotePathSet.has(remotePath);
           
-          if (isTextFile) {
-            if (!existsInFirestore && existsInStorage) {
-              log(`⚠️ Conflicto detectado (Falta en Firestore): ${path.basename(localPath)}`);
-              await this.updateFirestore(remotePath, localPath);
-              continue;
-            }
-            if (!existsInFirestore && !existsInStorage) {
-              await this.uploadFile(localPath);
-              continue;
-            }
-            if (existsInFirestore && !existsInStorage) {
-              await this.uploadFile(localPath);
-            }
-          } else {
-            if (!existsInStorage) {
-              await this.uploadFile(localPath);
-            }
+          if (!isTextFile) {
+            blockUpload(localPath, "extension no permitida");
+            continue;
+          }
+          if (!existsInFirestore && existsInStorage) {
+            log(`Conflicto detectado (Falta en Firestore): ${path.basename(localPath)}`);
+            await this.updateFirestore(remotePath, localPath);
+            continue;
+          }
+          if (!existsInFirestore && !existsInStorage) {
+            await this.uploadFile(localPath);
+            continue;
+          }
+          if (existsInFirestore && !existsInStorage) {
+            await this.uploadFile(localPath);
           }
         }
 
@@ -713,12 +890,15 @@ class SyncManager {
           const localPath = this.getLocalPath(fileRef.fullPath);
           if (!localPath || isIgnoredPath(localPath)) continue;
 
-          if (TEXT_EXTS.has(ext) && !firestorePathSet.has(fileRef.fullPath)) {
-            log(`🧹 Archivo huérfano en Storage: ${path.basename(localPath)}`);
+          if (!isAllowedTextExtension(ext)) {
+            continue;
+          }
+          if (!firestorePathSet.has(fileRef.fullPath)) {
+            log(`Archivo huérfano en Storage: ${path.basename(localPath)}`);
             try {
               await deleteObject(fileRef);
             } catch (err) {
-              log(`⚠️ Error eliminando huérfano: ${err.message}`);
+              log(`Error eliminando huérfano: ${err.message}`);
             }
             continue;
           }
@@ -824,9 +1004,10 @@ async function run() {
       await signInWithCustomToken(auth, token);
       log(`🔐 Autenticado con Firebase Custom Token`);
       
-      const manager = new SyncManager(storage, db, socket);
+      const manager = new SyncManager(storage, db, socket, rtdb);
       await manager.loadWorkspaceMounts();
       manager.setupFirestoreListener();
+      manager.setupRTDBListener(); // Listener de Realtime Database
       
       socket.on("remote-doc-change", async (data) => {
         log(`📨 Evento remoto recibido: ${data.action} ${data.docId || ''}`);
