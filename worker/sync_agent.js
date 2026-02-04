@@ -32,6 +32,24 @@ const POLL_INTERVAL_MS = (() => {
 const CLOCK_SKEW_MS = 2000;
 const DOWNLOAD_GRACE_MS = 15000; // Aumentado a 15s para dar margen al polling de Chokidar (5s) + latencia
 
+if (!WORKER_SECRET) {
+  console.error("❌ WORKER_SECRET is required.");
+  process.exit(1);
+}
+
+function generateSignedToken(token, secret) {
+  const info = parseToken(token);
+  const payload = JSON.stringify({
+    workspaceId: info.workspaceId,
+    workspaceType: info.workspaceType,
+    ownerId: info.userId,
+    timestamp: Date.now()
+  });
+  const payloadB64 = Buffer.from(payload).toString('base64');
+  const signature = crypto.createHmac('sha256', secret).update(payloadB64).digest('hex');
+  return `${payloadB64}.${signature}`;
+}
+
 function parseToken(token) {
   if (token.startsWith('personal:')) {
     return {
@@ -75,6 +93,7 @@ function log(message) {
   console.log(`${ts} - ${message}`);
 }
 
+const signedToken = generateSignedToken(WORKER_TOKEN, WORKER_SECRET);
 
 // Inicialización de Firebase Client SDK
 const app = initializeApp(FIREBASE_CONFIG);
@@ -722,16 +741,15 @@ async function run() {
   const socket = io(NEXUS_URL, {
     auth: {
       type: "sync-agent",
-      workerToken: WORKER_TOKEN,
-      secret: WORKER_SECRET
+      workerToken: signedToken
+      // secret: WORKER_SECRET // REMOVED: No longer sending raw secret
     },
     transports: ['websocket'],
     reconnection: true,
-    reconnectionDelay: 1000
-  });
+});
 
   socket.on("connect", () => {
-    log(`📡 Conectado al Hub (Socket ID: ${socket.id})`);
+    log(`🔌 Connected to Hub at ${NEXUS_URL}`);
   });
 
   socket.on("connect_error", (err) => {

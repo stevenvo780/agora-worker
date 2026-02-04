@@ -1,14 +1,17 @@
 import fs from 'fs';
 import { io } from "socket.io-client";
 import pty from 'node-pty';
+import crypto from 'crypto';
 
 const NEXUS_URL = process.env.NEXUS_URL || "http://localhost:3010";
 
-const WORKER_TOKEN = process.env.WORKER_TOKEN || "";
+// WORKER_TOKEN is now treated as the Workspace Identifier (Identity)
+const WORKER_ID = process.env.WORKER_TOKEN || "";
+const WORKER_SECRET = process.env.WORKER_SECRET || "";
 const SAFE_WORKSPACE_ID = /^[a-zA-Z0-9_:-]+$/;
 
-if (WORKER_TOKEN && !SAFE_WORKSPACE_ID.test(WORKER_TOKEN)) {
-  console.error("❌ WORKER_TOKEN contains invalid characters.");
+if (WORKER_ID && !SAFE_WORKSPACE_ID.test(WORKER_ID)) {
+  console.error("❌ WORKER_TOKEN (ID) contains invalid characters.");
   process.exit(1);
 }
 
@@ -27,24 +30,42 @@ function parseToken(token) {
   };
 }
 
-const tokenInfo = parseToken(WORKER_TOKEN);
+const tokenInfo = parseToken(WORKER_ID);
+
 console.log(`🔌 Worker Configuration:`);
 console.log(`   Hub URL: ${NEXUS_URL}`);
-console.log(`   Token: ${WORKER_TOKEN}`);
+console.log(`   Identity: ${tokenInfo.workspaceId.substring(0, 5)}... (Obfuscated)`);
 console.log(`   Type: ${tokenInfo.workspaceType}`);
-console.log(`   Workspace ID: ${tokenInfo.workspaceId}`);
 
-if (!WORKER_TOKEN) {
-  console.error("❌ WORKER_TOKEN is required. Set it in environment variables.");
-  console.error("   For personal workspace: WORKER_TOKEN=personal:<userId>");
-  console.error("   For shared workspace: WORKER_TOKEN=<workspaceId>");
+if (!WORKER_ID) {
+  console.error("❌ WORKER_TOKEN is required.");
   process.exit(1);
 }
+
+if (!WORKER_SECRET) {
+  console.error("❌ WORKER_SECRET is required for signing authentication tokens.");
+  process.exit(1);
+}
+
+function generateSignedToken(id, secret) {
+  const info = parseToken(id);
+  const payload = JSON.stringify({
+    workspaceId: info.workspaceId,
+    workspaceType: info.workspaceType,
+    ownerId: info.userId,
+    timestamp: Date.now()
+  });
+  const payloadB64 = Buffer.from(payload).toString('base64');
+  const signature = crypto.createHmac('sha256', secret).update(payloadB64).digest('hex');
+  return `${payloadB64}.${signature}`;
+}
+
+const signedToken = generateSignedToken(WORKER_ID, WORKER_SECRET);
 
 const socket = io(NEXUS_URL, {
   auth: {
     type: "worker",
-    workerToken: WORKER_TOKEN
+    workerToken: signedToken
   },
   transports: ['websocket'],  // Solo websocket, evita duplicados de polling
   reconnection: true,
@@ -95,7 +116,7 @@ socket.on("session-created", (data = {}) => {
     }
 
     const workdir = DEFAULT_WORKDIR;
-    console.log(`📂 Workspace: ${workspaceName || WORKER_TOKEN} -> ${workdir}`);
+    console.log(`📂 Workspace: ${workspaceName || WORKER_ID} -> ${workdir}`);
 
     if (!fs.existsSync(workdir)) {
         try {
