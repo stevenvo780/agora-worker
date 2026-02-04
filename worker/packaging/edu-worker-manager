@@ -145,6 +145,11 @@ start_worker() {
 
   [ ! -f "$config_file" ] && { echo "❌ Config not found: $workspace_id"; return 1; }
 
+  # Save global config before sourcing worker-specific config
+  local _WORKER_SECRET="$WORKER_SECRET"
+  local _FIREBASE_CONFIG="$FIREBASE_CONFIG"
+  local _FIREBASE_BUCKET="$FIREBASE_BUCKET"
+  
   source "$config_file"
   local container_name=$(get_container_name "$workspace_id")
 
@@ -153,9 +158,9 @@ start_worker() {
   local args=(run -d --name "$container_name" --network=host --restart unless-stopped)
   args+=(-e "NEXUS_URL=$NEXUS_URL")
   args+=(-e "WORKER_TOKEN=$WORKER_TOKEN")
-  [ -n "$WORKER_SECRET" ] && args+=(-e "WORKER_SECRET=$WORKER_SECRET")
-  [ -n "$FIREBASE_CONFIG" ] && args+=(-e "FIREBASE_CONFIG=$FIREBASE_CONFIG")
-  [ -n "$FIREBASE_BUCKET" ] && args+=(-e "FIREBASE_BUCKET=$FIREBASE_BUCKET")
+  [ -n "$_WORKER_SECRET" ] && args+=(-e "WORKER_SECRET=$_WORKER_SECRET")
+  [ -n "$_FIREBASE_CONFIG" ] && args+=(-e "FIREBASE_CONFIG=$_FIREBASE_CONFIG")
+  [ -n "$_FIREBASE_BUCKET" ] && args+=(-e "FIREBASE_BUCKET=$_FIREBASE_BUCKET")
   args+=(-v "${MOUNT_PATH}:/workspace")
 
   docker "${args[@]}" "$WORKER_IMAGE" >/dev/null
