@@ -3,7 +3,7 @@ set -e
 
 # Check for Firebase credentials
 # Priority: GOOGLE_APPLICATION_CREDENTIALS env var (mounted file)
-CREDS_FILE="${GOOGLE_APPLICATION_CREDENTIALS:-/app/credentials/serviceAccountKey.json}"
+CREDS_FILE="${GOOGLE_APPLICATION_CREDENTIALS:-/app/serviceAccountKey.json}"
 
 if [ -f "$CREDS_FILE" ]; then
     echo "🔑 Using Firebase credentials from: $CREDS_FILE"

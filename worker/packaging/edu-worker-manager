@@ -227,8 +227,8 @@ start_worker() {
     
     # Mount Firebase service account file if exists
     if [ -f "$SERVICE_ACCOUNT_PATH" ]; then
-        args+=(-v "${SERVICE_ACCOUNT_PATH}:/app/credentials/serviceAccountKey.json:ro")
-        args+=(-e "GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/serviceAccountKey.json")
+        args+=(-v "${SERVICE_ACCOUNT_PATH}:/app/serviceAccountKey.json:ro")
+        args+=(-e "GOOGLE_APPLICATION_CREDENTIALS=/app/serviceAccountKey.json")
     fi
     
     if [ -n "${FIREBASE_BUCKET:-}" ]; then
