@@ -118,6 +118,8 @@ cmd_add() {
   local mount_path="${BASE_MOUNT_PATH}/workspaces/${safe_id}"
 
   mkdir -p "$mount_path"
+  # Ensure workspace dir is owned by uid 1000 (estudiante inside container)
+  chown 1000:1000 "$mount_path"
 
   cat > "$config_file" <<EOF
 WORKSPACE_ID="${workspace_id}"
@@ -183,6 +185,9 @@ start_worker() {
   local container_name=$(get_container_name "$effective_id")
 
   docker rm -f "$container_name" 2>/dev/null || true
+
+  # Ensure workspace mount is owned by uid 1000 (estudiante inside container)
+  [ -d "${MOUNT_PATH}" ] && chown 1000:1000 "${MOUNT_PATH}" 2>/dev/null || true
 
   local args=(run -d --name "$container_name" --network=host --restart unless-stopped)
   args+=(-e "NEXUS_URL=$NEXUS_URL")

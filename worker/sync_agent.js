@@ -279,6 +279,10 @@ class SyncManager {
 
   // Publicar evento a RTDB para notificar cambios en tiempo real
   async publishSyncEvent(action, fileName, docId = null, folder = null) {
+    // Siempre notificar por socket (canal más confiable y directo)
+    this.notifyViaSocket(action, fileName, docId);
+
+    // También publicar a RTDB para clientes que lo escuchen
     try {
       const eventsRef = rtdbRef(this.rtdb, RTDB_SYNC_PATH);
       const eventData = {
@@ -292,9 +296,7 @@ class SyncManager {
       await push(eventsRef, eventData);
       log(`📡 RTDB: ${action} ${fileName}`);
     } catch (err) {
-      log(`⚠️ Error publicando a RTDB: ${err.message}`);
-      // Fallback a socket si RTDB falla
-      this.notifyViaSocket(action, fileName, docId);
+      log(`⚠️ Error publicando a RTDB: ${err.message} (socket ya notificó)`);
     }
   }
 
