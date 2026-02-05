@@ -42,7 +42,10 @@ Commands:
       Restart worker(s)
 
   status [workspace-id]
-      Show worker status
+      Show worker status (includes Workspace ID)
+
+  ids
+      List workspace IDs and names
 
   logs <workspace-id> [-f]
       Show worker logs
@@ -50,11 +53,15 @@ Commands:
   update [workspace-id|all]
       Pull latest image and restart worker(s)
 
+  resync <workspace-id|all>
+      Force a full sync (restart worker without pulling image)
+
 Examples:
   edu-worker-manager add myuserid --personal
   edu-worker-manager add Vt9HeKs --name "Griego"
   edu-worker-manager start all
   edu-worker-manager update all
+  edu-worker-manager resync all
 
 EOF
   exit 1
@@ -139,11 +146,20 @@ cmd_remove() {
 }
 
 start_worker() {
-  local workspace_id="$1"
-  local safe_id=$(get_safe_path "$workspace_id")
+  local requested_id="$1"
+  local safe_id=$(get_safe_path "$requested_id")
   local config_file="${WORKERS_CONFIG_DIR}/${safe_id}.conf"
 
-  [ ! -f "$config_file" ] && { echo "❌ Config not found: $workspace_id"; return 1; }
+  # Fallback: if caller passed safe_id, use it; otherwise error
+  if [ ! -f "$config_file" ]; then
+    local alt_config="${WORKERS_CONFIG_DIR}/${requested_id}.conf"
+    if [ -f "$alt_config" ]; then
+      config_file="$alt_config"
+    else
+      echo "❌ Config not found: $requested_id" >&2
+      return 1
+    fi
+  fi
 
   # Save global config before sourcing worker-specific config
   local _WORKER_SECRET="$WORKER_SECRET"
@@ -163,7 +179,8 @@ start_worker() {
   fi
   
   source "$config_file"
-  local container_name=$(get_container_name "$workspace_id")
+  local effective_id="${WORKSPACE_ID:-$requested_id}"
+  local container_name=$(get_container_name "$effective_id")
 
   docker rm -f "$container_name" 2>/dev/null || true
 
@@ -176,7 +193,7 @@ start_worker() {
   args+=(-v "${MOUNT_PATH}:/workspace")
 
   docker "${args[@]}" "$WORKER_IMAGE" >/dev/null
-  echo "✅ Started: ${WORKSPACE_NAME:-$workspace_id}"
+  echo "✅ Started: ${WORKSPACE_NAME:-$effective_id}"
 }
 
 cmd_start() {
@@ -189,7 +206,9 @@ cmd_start() {
     local count=0
     for conf in "${WORKERS_CONFIG_DIR}"/*.conf; do
       [ -f "$conf" ] || continue
-      start_worker "$(basename "$conf" .conf)" && ((count++)) || true
+      source "$conf"
+      local ws_id="${WORKSPACE_ID:-$(basename "$conf" .conf)}"
+      start_worker "$ws_id" && ((count++)) || true
     done
     echo "Started $count worker(s)"
   else
@@ -226,10 +245,16 @@ cmd_update() {
   cmd_restart "$target"
 }
 
+cmd_resync() {
+  local target="${1:-all}"
+  echo "Forzando resync (reinicio sin pull)..."
+  cmd_restart "$target"
+}
+
 cmd_status() {
   ensure_dirs
-  printf "%-30s %-10s %-10s %-8s\n" "WORKSPACE" "TYPE" "STATUS" "RTDB"
-  printf "%-30s %-10s %-10s %-8s\n" "------------------------------" "----------" "----------" "--------"
+  printf "%-36s %-24s %-10s %-10s %-8s\n" "WORKSPACE_ID" "NAME" "TYPE" "STATUS" "RTDB"
+  printf "%-36s %-24s %-10s %-10s %-8s\n" "------------------------------------" "------------------------" "----------" "----------" "--------"
 
   for conf in "${WORKERS_CONFIG_DIR}"/*.conf; do
     [ -f "$conf" ] || continue
@@ -245,8 +270,22 @@ cmd_status() {
     fi
 
     local name="${WORKSPACE_NAME:-$ws_id}"
-    [ ${#name} -gt 28 ] && name="${name:0:25}..."
-    printf "%-30s %-10s %-10s %-8s\n" "$name" "${WORKSPACE_TYPE:-shared}" "$status" "$rtdb"
+    [ ${#name} -gt 22 ] && name="${name:0:19}..."
+    printf "%-36s %-24s %-10s %-10s %-8s\n" "$ws_id" "$name" "${WORKSPACE_TYPE:-shared}" "$status" "$rtdb"
+  done
+}
+
+cmd_ids() {
+  ensure_dirs
+  printf "%-36s %-24s %-10s\n" "WORKSPACE_ID" "NAME" "TYPE"
+  printf "%-36s %-24s %-10s\n" "------------------------------------" "------------------------" "----------"
+  for conf in "${WORKERS_CONFIG_DIR}"/*.conf; do
+    [ -f "$conf" ] || continue
+    source "$conf"
+    local ws_id="${WORKSPACE_ID:-$(basename "$conf" .conf)}"
+    local name="${WORKSPACE_NAME:-$ws_id}"
+    [ ${#name} -gt 22 ] && name="${name:0:19}..."
+    printf "%-36s %-24s %-10s\n" "$ws_id" "$name" "${WORKSPACE_TYPE:-shared}"
   done
 }
 
@@ -275,7 +314,9 @@ case "$cmd" in
   stop) cmd_stop "${1:-}" ;;
   restart) cmd_restart "${1:-}" ;;
   update) cmd_update "${1:-}" ;;
+  resync) cmd_resync "${1:-}" ;;
   status|list|ls) cmd_status ;;
+  ids) cmd_ids ;;
   logs) cmd_logs "$@" ;;
   help|--help|-h) usage ;;
   *) echo "Unknown command: $cmd" >&2; usage ;;

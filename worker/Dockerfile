@@ -98,5 +98,8 @@ RUN chmod +x entrypoint.sh
 ENV NEXUS_URL=http://localhost:3010
 # WORKER_TOKEN must be provided at runtime (e.g., personal:<uid> or shared:<workspace-id>)
 
+# Run as non-root to keep workspace file ownership aligned with host user
+USER estudiante
+
 # Default command
 CMD ["./entrypoint.sh"]

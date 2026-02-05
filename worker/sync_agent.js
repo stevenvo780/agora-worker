@@ -40,6 +40,7 @@ const POLL_INTERVAL_MS = (() => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 30000;
 })();
 const CLOCK_SKEW_MS = 2000;
+const RTDB_CLOCK_SKEW_MS = 2 * 60 * 1000;
 const DOWNLOAD_GRACE_MS = 15000; // Aumentado a 15s para dar margen al polling de Chokidar (5s) + latencia
 
 if (!WORKER_SECRET) {
@@ -324,7 +325,8 @@ class SyncManager {
     
     this.rtdbUnsubscribe = onChildAdded(eventsRef, async (snapshot) => {
       const event = snapshot.val();
-      if (!event || event.timestamp < startTime) return;
+      if (!event) return;
+      if (typeof event.timestamp === 'number' && event.timestamp + RTDB_CLOCK_SKEW_MS < startTime) return;
       
       // Ignorar eventos propios (del worker)
       if (event.source === 'worker') return;
@@ -674,6 +676,7 @@ class SyncManager {
       const contentType = getContentTypeForExt(ext);
       await uploadBytes(fileRef, content, { contentType });
       log(`Subido: ${path.basename(localPath)} (${contentType})`);
+      this.trackLocalFile(localPath);
       await this.updateFirestore(remotePath, localPath);
     } catch (err) {
       if (err && (err.code === "storage/unauthorized" || err.code === "storage/unauthenticated")) {
@@ -830,9 +833,12 @@ class SyncManager {
         
         const firestoreDocs = await getDocs(q);
         const firestorePathSet = new Set();
+        const firestoreDocsByPath = new Map();
         firestoreDocs.forEach(docSnap => {
             const data = docSnap.data();
-            if (data.storagePath) firestorePathSet.add(data.storagePath);
+            if (!data.storagePath) return;
+            firestorePathSet.add(data.storagePath);
+            firestoreDocsByPath.set(data.storagePath, { id: docSnap.id, data });
         });
 
         // PART 0: Sincronizar estructura de carpetas desde Firestore
@@ -847,6 +853,10 @@ class SyncManager {
 
         // PART 1: Scan local files and directories
         const { files: localFiles, dirs: localDirs } = this.scanLocalFiles(mount.local);
+        // Track all local files to detect deletions even if watcher misses events
+        for (const localPath of localFiles) {
+          this.trackLocalFile(localPath);
+        }
         
         if (localDirs.length > 0) {
           log(`📁 Encontrados ${localDirs.length} directorios locales`);
@@ -877,6 +887,27 @@ class SyncManager {
           if (existsInFirestore && !existsInStorage) {
             await this.uploadFile(localPath);
           }
+        }
+
+        // PART 1.5: Reconciliar Firestore -> local (incluso si no hay objeto en Storage)
+        for (const [storagePath, docInfo] of firestoreDocsByPath.entries()) {
+          const localPath = this.getLocalPath(storagePath);
+          if (!localPath || isIgnoredPath(localPath)) continue;
+
+          if (fs.existsSync(localPath)) {
+            this.trackLocalFile(localPath);
+            continue;
+          }
+
+          // Si el archivo existió localmente y ya pasó el sync inicial, tratamos como borrado local
+          if (this.initialSyncDone && this.wasKnownLocally(localPath)) {
+            this.untrackLocalFile(localPath);
+            await this.handleLocalDelete(localPath);
+            continue;
+          }
+
+          // Si no existía localmente, crear desde Firestore (contenido) o Storage (fallback)
+          await this.syncDocumentToLocal(docInfo.data, localPath);
         }
 
         // PART 2: Process remote files

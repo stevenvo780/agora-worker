@@ -23,7 +23,13 @@ fi
 # Start Sync Agent in background (auth via Hub Custom Token)
 if [ -n "$WORKER_SECRET" ] && [ -n "$WORKER_TOKEN" ]; then
     echo "📡 Starting Sync Agent..."
-    node /app/sync_agent.js 2>&1 | tee /var/log/sync_agent.log &
+    LOG_PATH="${SYNC_AGENT_LOG:-/var/log/sync_agent.log}"
+    if ! (mkdir -p "$(dirname "$LOG_PATH")" && touch "$LOG_PATH" 2>/dev/null); then
+        LOG_PATH="${SYNC_AGENT_LOG:-${HOME:-/home/estudiante}/sync_agent.log}"
+        mkdir -p "$(dirname "$LOG_PATH")" 2>/dev/null || true
+        touch "$LOG_PATH" 2>/dev/null || true
+    fi
+    node /app/sync_agent.js 2>&1 | tee "$LOG_PATH" &
 else
     echo "⚠️  WORKER_SECRET or WORKER_TOKEN not set. Sync Agent disabled."
 fi
