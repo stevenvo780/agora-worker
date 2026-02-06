@@ -622,14 +622,14 @@ class SyncManager {
         log(`Firestore documento creado: ${newDoc.id} (${fileName}) en carpeta: ${folder}`);
         this.notifyFileChange('created', fileName, newDoc.id);
       } else {
-        snapshot.forEach(async (docSnap) => {
+        for (const docSnap of snapshot.docs) {
           await updateDoc(docSnap.ref, {
             content,
             updatedAt: serverTimestamp(),
           });
           log(`Firestore actualizado: ${docSnap.id}`);
           this.notifyFileChange('updated', path.basename(localPath), docSnap.id);
-        });
+        }
       }
     } catch (err) {
       log(`Error sincronizando Firestore: ${err.message}`);
