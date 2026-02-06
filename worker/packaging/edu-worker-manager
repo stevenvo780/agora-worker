@@ -189,10 +189,10 @@ start_worker() {
   # Ensure workspace mount is owned by uid 1000 (estudiante inside container)
   [ -d "${MOUNT_PATH}" ] && chown 1000:1000 "${MOUNT_PATH}" 2>/dev/null || true
 
-  # Persistent volumes for AI tool configs (.codex, .gemini, etc.)
-  local tool_config_path="${BASE_MOUNT_PATH}/tool-configs/${safe_id}"
-  mkdir -p "${tool_config_path}/codex" "${tool_config_path}/gemini"
-  chown 1000:1000 "${tool_config_path}" "${tool_config_path}/codex" "${tool_config_path}/gemini" 2>/dev/null || true
+  # Persistent volume for entire /home/estudiante (preserves .codex, .gemini, and any future tools)
+  local home_persist_path="${BASE_MOUNT_PATH}/home/${safe_id}"
+  mkdir -p "${home_persist_path}"
+  chown 1000:1000 "${home_persist_path}" 2>/dev/null || true
 
   local args=(run -d --name "$container_name" --network=host --restart unless-stopped)
   args+=(-e "NEXUS_URL=$NEXUS_URL")
@@ -201,8 +201,7 @@ start_worker() {
   args+=(-e "FIREBASE_CONFIG=$_FIREBASE_CONFIG")
   [ -n "$_FIREBASE_BUCKET" ] && args+=(-e "FIREBASE_BUCKET=$_FIREBASE_BUCKET")
   args+=(-v "${MOUNT_PATH}:/workspace")
-  args+=(-v "${tool_config_path}/codex:/home/estudiante/.codex")
-  args+=(-v "${tool_config_path}/gemini:/home/estudiante/.gemini")
+  args+=(-v "${home_persist_path}:/home/estudiante")
 
   docker "${args[@]}" "$WORKER_IMAGE" >/dev/null
   echo "✅ Started: ${WORKSPACE_NAME:-$effective_id}"
