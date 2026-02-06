@@ -90,7 +90,56 @@ if (!WORKER_TOKEN) {
   process.exit(1);
 }
 
-const IGNORE_LIST = new Set([".git", ".DS_Store", "node_modules", ".next"]);
+const IGNORE_LIST = new Set([".git", ".DS_Store", "node_modules", ".next", "repos"]);
+
+// ── .syncignore support ──────────────────────────────────────────────
+const SYNCIGNORE_FILE = path.join(SYNC_DIR, ".syncignore");
+let syncIgnorePatterns = new Set();   // dynamic set loaded from .syncignore
+
+function loadSyncIgnore() {
+  try {
+    if (!fs.existsSync(SYNCIGNORE_FILE)) return;
+    const raw = fs.readFileSync(SYNCIGNORE_FILE, "utf-8");
+    const newPatterns = new Set();
+    for (const line of raw.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      // Strip trailing slash (directory marker) for name matching
+      const pattern = trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
+      if (pattern) newPatterns.add(pattern);
+    }
+    syncIgnorePatterns = newPatterns;
+    log(`📋 .syncignore cargado: ${newPatterns.size} patrones → [${[...newPatterns].join(", ")}]`);
+  } catch (err) {
+    log(`⚠️  Error leyendo .syncignore: ${err.message}`);
+  }
+}
+
+// Load once at startup
+loadSyncIgnore();
+
+// Watch for changes (re-read on modify)
+let syncIgnoreWatcher = null;
+function watchSyncIgnore() {
+  try {
+    if (syncIgnoreWatcher) syncIgnoreWatcher.close();
+    if (!fs.existsSync(SYNCIGNORE_FILE)) return;
+    syncIgnoreWatcher = fs.watch(SYNCIGNORE_FILE, { persistent: false }, (eventType) => {
+      if (eventType === "change" || eventType === "rename") {
+        log("🔄 .syncignore modificado, recargando…");
+        loadSyncIgnore();
+      }
+    });
+  } catch (_) { /* ignore watch errors */ }
+}
+watchSyncIgnore();
+// Also periodically check in case the file is created later
+setInterval(() => {
+  loadSyncIgnore();
+  watchSyncIgnore();
+}, 60_000);
+// ── end .syncignore ──────────────────────────────────────────────────
+
 const ALLOWED_TEXT_EXTS = new Set([
   ".md",
   ".txt",
@@ -153,6 +202,7 @@ function toPosixPath(localPath) {
 }
 
 function isIgnoredPath(filePath) {
+  // Always allow .syncignore itself to NOT be synced (it's a dotfile, already ignored)
   let rel;
   try {
     rel = path.relative(SYNC_DIR, filePath);
@@ -166,6 +216,15 @@ function isIgnoredPath(filePath) {
     if (!part) continue;
     if (part.startsWith(".")) return true;
     if (IGNORE_LIST.has(part)) return true;
+    // Check dynamic .syncignore patterns
+    if (syncIgnorePatterns.has(part)) return true;
+    // Support simple wildcard matching (e.g., *.pyc, *.o)
+    for (const pattern of syncIgnorePatterns) {
+      if (pattern.includes("*")) {
+        const regex = new RegExp("^" + pattern.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$");
+        if (regex.test(part)) return true;
+      }
+    }
   }
   return false;
 }

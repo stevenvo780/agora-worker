@@ -1,6 +1,6 @@
 {
   "name": "simple-worker",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "type": "module",
   "scripts": {
     "deb": "bash scripts/build-deb.sh",

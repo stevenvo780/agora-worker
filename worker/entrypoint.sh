@@ -11,6 +11,48 @@ echo "🔌 Worker Configuration:"
 echo "   Hub URL: ${NEXUS_URL:-http://localhost:3010}"
 echo "   Token: ${WORKER_TOKEN:-<not set>}"
 
+# ── Create default .syncignore and repos/ if missing ──────────────
+WORKSPACE_DIR="/workspace"
+SYNCIGNORE_FILE="${WORKSPACE_DIR}/.syncignore"
+REPOS_DIR="${WORKSPACE_DIR}/repos"
+
+if [ ! -f "$SYNCIGNORE_FILE" ]; then
+    echo "📋 Creating default .syncignore..."
+    cat > "$SYNCIGNORE_FILE" << 'SYNCIGNORE'
+# ── .syncignore ──────────────────────────────────────────────
+# Archivos y carpetas listados aquí NO se sincronizan con la nube.
+# Uno por línea. Líneas vacías y comentarios (#) se ignoran.
+# Usa nombre/ para carpetas, *.ext para extensiones.
+# ──────────────────────────────────────────────────────────────
+
+# Carpeta de repositorios locales (nunca sincronizar)
+repos
+
+# Build artifacts & caches
+__pycache__
+*.pyc
+*.o
+*.so
+dist
+build
+target
+*.class
+*.jar
+
+# Paquetes pesados (ya están en IGNORE_LIST por defecto)
+# node_modules
+# .git
+# .next
+SYNCIGNORE
+    echo "   ✅ .syncignore creado con valores por defecto"
+fi
+
+if [ ! -d "$REPOS_DIR" ]; then
+    mkdir -p "$REPOS_DIR"
+    echo "   ✅ Carpeta repos/ creada"
+fi
+# ── end .syncignore setup ─────────────────────────────────────────
+
 # Determine workspace type from token
 if [[ "$WORKER_TOKEN" == personal:* ]]; then
     echo "   Type: personal"
