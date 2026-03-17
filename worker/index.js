@@ -1,26 +1,26 @@
 /**
  * Worker Entry Point
- * 
+ *
  * Manages PTY sessions and communicates with the Hub via Socket.io.
  */
 
 import fs from 'fs';
-import { io } from "socket.io-client";
+import { io } from 'socket.io-client';
 import pty from 'node-pty';
 import crypto from 'crypto';
 
-const NEXUS_URL = process.env.NEXUS_URL || "http://localhost:3010";
+const NEXUS_URL = process.env.NEXUS_URL || 'http://localhost:3010';
 
 /**
  * Validates and parses the worker token.
  * WORKER_TOKEN is treated as the Workspace Identifier (Identity).
  */
-const WORKER_ID = process.env.WORKER_TOKEN || "";
-const WORKER_SECRET = process.env.WORKER_SECRET || "";
+const WORKER_ID = process.env.WORKER_TOKEN || '';
+const WORKER_SECRET = process.env.WORKER_SECRET || '';
 const SAFE_WORKSPACE_ID = /^[a-zA-Z0-9_:-]+$/;
 
 if (WORKER_ID && !SAFE_WORKSPACE_ID.test(WORKER_ID)) {
-  console.error("❌ WORKER_TOKEN (ID) contains invalid characters.");
+  console.error('❌ WORKER_TOKEN (ID) contains invalid characters.');
   process.exit(1);
 }
 
@@ -52,12 +52,12 @@ console.log(`   Identity: ${tokenInfo.workspaceId.substring(0, 5)}... (Obfuscate
 console.log(`   Type: ${tokenInfo.workspaceType}`);
 
 if (!WORKER_ID) {
-  console.error("❌ WORKER_TOKEN is required.");
+  console.error('❌ WORKER_TOKEN is required.');
   process.exit(1);
 }
 
 if (!WORKER_SECRET) {
-  console.error("❌ WORKER_SECRET is required for signing authentication tokens.");
+  console.error('❌ WORKER_SECRET is required for signing authentication tokens.');
   process.exit(1);
 }
 
@@ -84,7 +84,7 @@ const signedToken = generateSignedToken(WORKER_ID, WORKER_SECRET);
 
 const socket = io(NEXUS_URL, {
   auth: {
-    type: "worker",
+    type: 'worker',
     workerToken: signedToken
   },
   transports: ['websocket'],
@@ -95,23 +95,23 @@ const socket = io(NEXUS_URL, {
   randomizationFactor: 0.3
 });
 
-socket.on("connect", () => {
+socket.on('connect', () => {
   console.log(`✅ Connected to Hub! (Socket ID: ${socket.id})`);
 });
 
-socket.on("connect_error", (err) => {
-  console.error("❌ Connection Error:", err.message);
+socket.on('connect_error', (err) => {
+  console.error('❌ Connection Error:', err.message);
 });
 
-socket.on("disconnect", (reason) => {
+socket.on('disconnect', (reason) => {
   console.log(`🔌 Disconnected from Hub: ${reason}`);
 });
 
-socket.on("reconnect", (attemptNumber) => {
+socket.on('reconnect', (attemptNumber) => {
   console.log(`🔄 Reconnected to Hub after ${attemptNumber} attempts`);
 });
 
-socket.on("reconnect_attempt", (attemptNumber) => {
+socket.on('reconnect_attempt', (attemptNumber) => {
   console.log(`🔄 Reconnection attempt #${attemptNumber}...`);
 });
 
@@ -132,22 +132,22 @@ setInterval(() => {
                 sessions.delete(sessionId);
             }
             SESSION_LAST_ACTIVITY.delete(sessionId);
-            socket.emit("session-ended", { sessionId, reason: "Session idle timeout" });
+            socket.emit('session-ended', { sessionId, reason: 'Session idle timeout' });
         }
     }
 }, 5 * 60 * 1000);
 
-const DEFAULT_WORKDIR = "/workspace";
+const DEFAULT_WORKDIR = '/workspace';
 
 if (!fs.existsSync(DEFAULT_WORKDIR)) {
     try {
         fs.mkdirSync(DEFAULT_WORKDIR, { recursive: true });
     } catch (e) {
-        console.error("Failed to create workspace:", e);
+        console.error('Failed to create workspace:', e);
     }
 }
 
-socket.on("session-created", (data = {}) => {
+socket.on('session-created', (data = {}) => {
     const { id: sessionId, workspaceId, workspaceName } = data;
     console.log(`📟 Creating PTY for session ${sessionId}`);
 
@@ -164,7 +164,7 @@ socket.on("session-created", (data = {}) => {
             if (oldPty) oldPty.kill();
             sessions.delete(oldId);
             SESSION_LAST_ACTIVITY.delete(oldId);
-            socket.emit("session-ended", { sessionId: oldId, reason: "Session limit reached" });
+            socket.emit('session-ended', { sessionId: oldId, reason: 'Session limit reached' });
             console.warn(`⚠️ Session limit reached, killed oldest session ${oldId}`);
         }
     }
@@ -176,7 +176,7 @@ socket.on("session-created", (data = {}) => {
         try {
             fs.mkdirSync(workdir, { recursive: true });
         } catch (e) {
-            console.error("Failed to create workspace dir:", e);
+            console.error('Failed to create workspace dir:', e);
         }
     }
 
@@ -198,18 +198,18 @@ socket.on("session-created", (data = {}) => {
     SESSION_LAST_ACTIVITY.set(sessionId, Date.now());
 
     ptyProcess.onData((data) => {
-        socket.emit("output", { sessionId, data });
+        socket.emit('output', { sessionId, data });
     });
 
     ptyProcess.onExit(({ exitCode }) => {
         console.log(`📟 PTY for session ${sessionId} exited with code ${exitCode}`);
         sessions.delete(sessionId);
         SESSION_LAST_ACTIVITY.delete(sessionId);
-        socket.emit("session-ended", { sessionId, reason: `Shell exited (code ${exitCode})` });
+        socket.emit('session-ended', { sessionId, reason: `Shell exited (code ${exitCode})` });
     });
 });
 
-socket.on("execute", (data) => {
+socket.on('execute', (data) => {
     const { sessionId, command } = data;
     const ptyProcess = sessions.get(sessionId);
 
@@ -219,7 +219,7 @@ socket.on("execute", (data) => {
     }
 });
 
-socket.on("resize", (data) => {
+socket.on('resize', (data) => {
     const { sessionId, cols, rows } = data;
     const ptyProcess = sessions.get(sessionId);
 
@@ -227,7 +227,7 @@ socket.on("resize", (data) => {
         try {
             ptyProcess.resize(cols, rows);
         } catch (e) {
-            console.error("Resize error:", e);
+            console.error('Resize error:', e);
         }
     }
 });
@@ -244,12 +244,11 @@ const killSession = (data) => {
     }
 };
 
-socket.on("end-session", killSession);
-socket.on("kill-session", killSession);
+socket.on('end-session', killSession);
+socket.on('kill-session', killSession);
 
-
-socket.on("disconnect", () => {
-    console.log("🔌 Disconnected from Hub, cleaning up sessions...");
+socket.on('disconnect', () => {
+    console.log('🔌 Disconnected from Hub, cleaning up sessions...');
     for (const ptyProcess of sessions.values()) {
         ptyProcess.kill();
     }

@@ -1,30 +1,30 @@
-import fs from "fs";
-import path from "path";
-import crypto from "crypto";
-import chokidar from "chokidar";
-import { initializeApp } from "firebase/app";
-import { getAuth, signInWithCustomToken } from "firebase/auth";
-import { 
-  getFirestore, collection, query, where, onSnapshot, 
-  getDocs, addDoc, updateDoc, deleteDoc, 
-  serverTimestamp 
-} from "firebase/firestore";
-import { 
-  getStorage, ref, uploadBytes, 
-  getMetadata, deleteObject, getBytes, listAll 
-} from "firebase/storage";
-import { 
+import fs from 'fs';
+import path from 'path';
+import crypto from 'crypto';
+import chokidar from 'chokidar';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInWithCustomToken } from 'firebase/auth';
+import {
+  getFirestore, collection, query, where, onSnapshot,
+  getDocs, addDoc, updateDoc, deleteDoc,
+  serverTimestamp
+} from 'firebase/firestore';
+import {
+  getStorage, ref, uploadBytes,
+  getMetadata, deleteObject, getBytes, listAll
+} from 'firebase/storage';
+import {
   getDatabase, ref as rtdbRef, push, onChildAdded, remove
-} from "firebase/database";
-import { io } from "socket.io-client";
+} from 'firebase/database';
+import { io } from 'socket.io-client';
 
-const WORKER_TOKEN = process.env.WORKER_TOKEN || "";
-const NEXUS_URL = process.env.NEXUS_URL || "http://localhost:3010";
+const WORKER_TOKEN = process.env.WORKER_TOKEN || '';
+const NEXUS_URL = process.env.NEXUS_URL || 'http://localhost:3010';
 // Configuración de Firebase debe venir por variable de entorno JSON
 const FIREBASE_CONFIG = (() => {
   const config = process.env.FIREBASE_CONFIG
     ? JSON.parse(process.env.FIREBASE_CONFIG)
-    : { storageBucket: process.env.FIREBASE_BUCKET || "udea-filosofia.firebasestorage.app" };
+    : { storageBucket: process.env.FIREBASE_BUCKET || 'udea-filosofia.firebasestorage.app' };
   // Asegurar que tiene databaseURL para RTDB
   if (!config.databaseURL && config.projectId) {
     config.databaseURL = `https://${config.projectId}-default-rtdb.firebaseio.com`;
@@ -32,8 +32,8 @@ const FIREBASE_CONFIG = (() => {
   return config;
 })();
 
-const SYNC_DIR = "/workspace";
-const WORKER_SECRET = process.env.WORKER_SECRET || "";
+const SYNC_DIR = '/workspace';
+const WORKER_SECRET = process.env.WORKER_SECRET || '';
 const POLL_INTERVAL_MS = (() => {
   const raw = process.env.SYNC_POLL_MS;
   const parsed = raw ? Number(raw) : 30000;
@@ -44,13 +44,13 @@ const RTDB_CLOCK_SKEW_MS = 2 * 60 * 1000;
 const DOWNLOAD_GRACE_MS = 15000;
 
 // ── Rename detection ─────────────────────────────────────────────────
-const RENAME_WINDOW_MS = 3000;   // Ventana para detectar unlink→add como rename
+const RENAME_WINDOW_MS = 3000; // Ventana para detectar unlink→add como rename
 const DELETE_DEBOUNCE_MS = 2500; // Debounce deletes para dar tiempo a detectar rename
-const BATCH_DEBOUNCE_MS = 1500;  // Debounce para batch de operaciones (move carpeta)
+const BATCH_DEBOUNCE_MS = 1500; // Debounce para batch de operaciones (move carpeta)
 const MAX_PENDING_DELETES = 200; // Límite de deletes pendientes en buffer
 
 if (!WORKER_SECRET) {
-  console.error("❌ WORKER_SECRET is required.");
+  console.error('❌ WORKER_SECRET is required.');
   process.exit(1);
 }
 
@@ -71,16 +71,16 @@ function parseToken(token) {
   if (token.startsWith('personal:')) {
     const userId = token.substring('personal:'.length);
     return {
-      workspaceId: token,              // Token completo para identificación interna
+      workspaceId: token, // Token completo para identificación interna
       firestoreWorkspaceId: 'personal', // Para guardar en Firestore (consistente con frontend)
       workspaceType: 'personal',
-      userId: userId,
+      userId,
       storagePath: `users/${userId}`
     };
   }
   return {
     workspaceId: token,
-    firestoreWorkspaceId: token,       // Para shared es el mismo
+    firestoreWorkspaceId: token, // Para shared es el mismo
     workspaceType: 'shared',
     userId: null,
     storagePath: `workspaces/${token}`
@@ -90,37 +90,37 @@ function parseToken(token) {
 const tokenInfo = parseToken(WORKER_TOKEN);
 
 if (!WORKER_TOKEN) {
-  console.error("❌ WORKER_TOKEN is required. Set it in environment variables.");
-  console.error("   For personal workspace: WORKER_TOKEN=personal:<userId>");
-  console.error("   For shared workspace: WORKER_TOKEN=<workspaceId>");
+  console.error('❌ WORKER_TOKEN is required. Set it in environment variables.');
+  console.error('   For personal workspace: WORKER_TOKEN=personal:<userId>');
+  console.error('   For shared workspace: WORKER_TOKEN=<workspaceId>');
   process.exit(1);
 }
 
-const IGNORE_LIST = new Set([".git", ".DS_Store", "node_modules", ".next", "repos"]);
+const IGNORE_LIST = new Set(['.git', '.DS_Store', 'node_modules', '.next', 'repos']);
 
 // ── .syncignore support ──────────────────────────────────────────────
-const SYNCIGNORE_FILE = path.join(SYNC_DIR, ".syncignore");
-let syncIgnorePatterns = new Set();   // dynamic set loaded from .syncignore
-let syncIgnoreRegexes = [];           // pre-compiled regex cache for wildcard patterns
+const SYNCIGNORE_FILE = path.join(SYNC_DIR, '.syncignore');
+let syncIgnorePatterns = new Set(); // dynamic set loaded from .syncignore
+let syncIgnoreRegexes = []; // pre-compiled regex cache for wildcard patterns
 
 function loadSyncIgnore() {
   try {
     if (!fs.existsSync(SYNCIGNORE_FILE)) return;
-    const raw = fs.readFileSync(SYNCIGNORE_FILE, "utf-8");
+    const raw = fs.readFileSync(SYNCIGNORE_FILE, 'utf-8');
     const newPatterns = new Set();
-    for (const line of raw.split("\n")) {
+    for (const line of raw.split('\n')) {
       const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
+      if (!trimmed || trimmed.startsWith('#')) continue;
       // Strip trailing slash (directory marker) for name matching
-      const pattern = trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
+      const pattern = trimmed.endsWith('/') ? trimmed.slice(0, -1) : trimmed;
       if (pattern) newPatterns.add(pattern);
     }
     syncIgnorePatterns = newPatterns;
     // Pre-compile wildcard patterns once so isIgnoredPath doesn't recompile on every call
     syncIgnoreRegexes = [...newPatterns]
-      .filter(p => p.includes("*"))
-      .map(p => new RegExp("^" + p.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$"));
-    log(`📋 .syncignore cargado: ${newPatterns.size} patrones → [${[...newPatterns].join(", ")}]`);
+      .filter(p => p.includes('*'))
+      .map(p => new RegExp(`^${p.replace(/\./g, '\\.').replace(/\*/g, '.*')}$`));
+    log(`📋 .syncignore cargado: ${newPatterns.size} patrones → [${[...newPatterns].join(', ')}]`);
   } catch (err) {
     log(`⚠️  Error leyendo .syncignore: ${err.message}`);
   }
@@ -136,8 +136,8 @@ function watchSyncIgnore() {
     if (syncIgnoreWatcher) syncIgnoreWatcher.close();
     if (!fs.existsSync(SYNCIGNORE_FILE)) return;
     syncIgnoreWatcher = fs.watch(SYNCIGNORE_FILE, { persistent: false }, (eventType) => {
-      if (eventType === "change" || eventType === "rename") {
-        log("🔄 .syncignore modificado, recargando…");
+      if (eventType === 'change' || eventType === 'rename') {
+        log('🔄 .syncignore modificado, recargando…');
         loadSyncIgnore();
       }
     });
@@ -152,37 +152,37 @@ setInterval(() => {
 // ── end .syncignore ──────────────────────────────────────────────────
 
 const ALLOWED_TEXT_EXTS = new Set([
-  ".md",
-  ".txt",
-  ".json",
-  ".xml",
-  ".yaml",
-  ".yml",
-  ".toml",
-  ".csv",
-  ".html",
-  ".css",
-  ".scss",
-  ".less",
-  ".ini",
-  ".log",
+  '.md',
+  '.txt',
+  '.json',
+  '.xml',
+  '.yaml',
+  '.yml',
+  '.toml',
+  '.csv',
+  '.html',
+  '.css',
+  '.scss',
+  '.less',
+  '.ini',
+  '.log'
 ]);
 
 const CONTENT_TYPE_BY_EXT = new Map([
-  [".md", "text/markdown"],
-  [".txt", "text/plain"],
-  [".json", "application/json"],
-  [".xml", "application/xml"],
-  [".yaml", "application/yaml"],
-  [".yml", "application/x-yaml"],
-  [".toml", "application/toml"],
-  [".csv", "text/csv"],
-  [".html", "text/html"],
-  [".css", "text/css"],
-  [".scss", "text/x-scss"],
-  [".less", "text/x-less"],
-  [".ini", "text/plain"],
-  [".log", "text/plain"],
+  ['.md', 'text/markdown'],
+  ['.txt', 'text/plain'],
+  ['.json', 'application/json'],
+  ['.xml', 'application/xml'],
+  ['.yaml', 'application/yaml'],
+  ['.yml', 'application/x-yaml'],
+  ['.toml', 'application/toml'],
+  ['.csv', 'text/csv'],
+  ['.html', 'text/html'],
+  ['.css', 'text/css'],
+  ['.scss', 'text/x-scss'],
+  ['.less', 'text/x-less'],
+  ['.ini', 'text/plain'],
+  ['.log', 'text/plain']
 ]);
 
 const BLOCKED_UPLOAD_TTL_MS = 10 * 60 * 1000;
@@ -203,10 +203,9 @@ const storage = getStorage(app);
 const rtdb = getDatabase(app);
 
 // Path de eventos RTDB para este workspace
-const RTDB_SYNC_PATH = tokenInfo.workspaceType === 'personal' 
+const RTDB_SYNC_PATH = tokenInfo.workspaceType === 'personal'
   ? `sync-events/personal_${tokenInfo.userId}`
   : `sync-events/${tokenInfo.workspaceId}`;
-
 
 function toPosixPath(localPath) {
   return localPath.split(path.sep).join(path.posix.sep);
@@ -220,12 +219,12 @@ function isIgnoredPath(filePath) {
   } catch (_err) {
     return true;
   }
-  if (!rel || rel.startsWith("..")) return true;
+  if (!rel || rel.startsWith('..')) return true;
 
   const parts = rel.split(path.sep);
   for (const part of parts) {
     if (!part) continue;
-    if (part.startsWith(".")) return true;
+    if (part.startsWith('.')) return true;
     if (IGNORE_LIST.has(part)) return true;
     // Check dynamic .syncignore patterns
     if (syncIgnorePatterns.has(part)) return true;
@@ -246,7 +245,7 @@ function isAllowedTextExtension(ext) {
 }
 
 function getContentTypeForExt(ext) {
-  return CONTENT_TYPE_BY_EXT.get(ext) || "text/plain";
+  return CONTENT_TYPE_BY_EXT.get(ext) || 'text/plain';
 }
 
 function isUploadBlocked(localPath) {
@@ -269,11 +268,11 @@ function blockUpload(localPath, reason) {
 
 function md5Base64(filePath) {
   return new Promise((resolve, reject) => {
-    const hash = crypto.createHash("md5");
+    const hash = crypto.createHash('md5');
     const stream = fs.createReadStream(filePath);
-    stream.on("data", (chunk) => hash.update(chunk));
-    stream.on("error", reject);
-    stream.on("end", () => resolve(hash.digest("base64")));
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('error', reject);
+    stream.on('end', () => resolve(hash.digest('base64')));
   });
 }
 
@@ -297,16 +296,16 @@ class SyncManager {
     this.lastEventTime = Date.now(); // Para filtrar eventos antiguos
 
     // ── Rename detection state ──
-    this.pendingDeletes = new Map();  // localPath → { timer, remotePath, docId, content, hash, ts }
-    this.pendingAdds = new Map();     // localPath → { timer, ts }
+    this.pendingDeletes = new Map(); // localPath → { timer, remotePath, docId, content, hash, ts }
+    this.pendingAdds = new Map(); // localPath → { timer, ts }
     this.renameBatchTimer = null;
     this.pendingFolderRenames = new Map(); // oldDir -> newDir
 
     this.mounts.push({
       local: SYNC_DIR,
-      remote: tokenInfo.storagePath,
+      remote: tokenInfo.storagePath
     });
-    
+
     if (tokenInfo.workspaceType === 'personal') {
       log(`🔹 Modo Personal: Sincronizando ${tokenInfo.storagePath} para usuario ${tokenInfo.userId}`);
     } else {
@@ -378,8 +377,8 @@ class SyncManager {
     let contentHash = null;
     try {
       const q = query(
-        collection(this.db, "documents"),
-        where("storagePath", "==", remotePath)
+        collection(this.db, 'documents'),
+        where('storagePath', '==', remotePath)
       );
       const snapshot = await getDocs(q);
       if (!snapshot.empty) {
@@ -418,8 +417,8 @@ class SyncManager {
     log(`🗑️ Ejecutando delete: ${path.basename(localPath)}`);
     try {
       if (docId) {
-        const docRef = collection(this.db, "documents");
-        const q = query(docRef, where("__name__", "==", docId));
+        const docRef = collection(this.db, 'documents');
+        const q = query(docRef, where('__name__', '==', docId));
         const snap = await getDocs(q);
         if (!snap.empty) {
           await deleteDoc(snap.docs[0].ref);
@@ -477,10 +476,10 @@ class SyncManager {
         const relPath = path.relative(SYNC_DIR, newLocalPath);
         const dirPath = path.dirname(relPath);
         const newFolder = (dirPath === '.' || dirPath === '') ? 'No estructurado' : dirPath.split(path.sep).join('/');
-        const newName = path.basename(newLocalPath).replace(/\.[^/.]+$/, "");
+        const newName = path.basename(newLocalPath).replace(/\.[^/.]+$/, '');
 
         // Actualizar doc existente con nuevo path y nombre
-        const q = query(collection(this.db, "documents"), where("__name__", "==", pending.docId));
+        const q = query(collection(this.db, 'documents'), where('__name__', '==', pending.docId));
         const snap = await getDocs(q);
         if (!snap.empty) {
           await updateDoc(snap.docs[0].ref, {
@@ -541,10 +540,10 @@ class SyncManager {
   // Detectar rename de carpeta completa: múltiples deletes + adds con misma estructura
   async handleFolderRename(oldDir, newDir) {
     log(`📁 RENAME de carpeta detectado: ${path.relative(SYNC_DIR, oldDir)} → ${path.relative(SYNC_DIR, newDir)}`);
-    
+
     const oldRelPath = path.relative(SYNC_DIR, oldDir);
     const newRelPath = path.relative(SYNC_DIR, newDir);
-    
+
     try {
       // Actualizar todos los docs de Firestore que tengan folder con el path viejo
       let q;
@@ -553,28 +552,28 @@ class SyncManager {
       } else {
         q = query(collection(this.db, 'documents'), where('workspaceId', '==', tokenInfo.workspaceId));
       }
-      
+
       const snapshot = await getDocs(q);
       let updated = 0;
-      
+
       for (const docSnap of snapshot.docs) {
         const data = docSnap.data();
         if (!data.folder || !data.storagePath) continue;
-        
+
         // Verificar si el folder empieza con el path viejo
-        if (data.folder === oldRelPath || data.folder.startsWith(oldRelPath + '/')) {
+        if (data.folder === oldRelPath || data.folder.startsWith(`${oldRelPath}/`)) {
           const newFolder = data.folder.replace(oldRelPath, newRelPath);
           const newStoragePath = data.storagePath.replace(
             `${tokenInfo.storagePath}/${oldRelPath}`,
             `${tokenInfo.storagePath}/${newRelPath}`
           );
-          
+
           await updateDoc(docSnap.ref, {
             folder: newFolder,
             storagePath: newStoragePath,
             updatedAt: serverTimestamp()
           });
-          
+
           // Mover en Storage
           try {
             const oldRef = ref(this.storage, data.storagePath);
@@ -588,11 +587,11 @@ class SyncManager {
               log(`⚠️ Error moviendo en Storage: ${e.message}`);
             }
           }
-          
+
           updated++;
         }
       }
-      
+
       log(`✅ Carpeta renombrada: ${updated} documentos actualizados`);
     } catch (err) {
       log(`❌ Error en folder rename: ${err.message}`);
@@ -624,7 +623,7 @@ class SyncManager {
         type: action, // 'created', 'updated', 'deleted'
         path: fileName,
         folder: folder || 'No estructurado',
-        docId: docId,
+        docId,
         timestamp: Date.now(),
         source: 'worker' // Para distinguir origen
       };
@@ -655,21 +654,21 @@ class SyncManager {
   // Configurar listener de RTDB para eventos del frontend
   setupRTDBListener() {
     log(`🔔 Configurando listener de RTDB para eventos del frontend...`);
-    
+
     const eventsRef = rtdbRef(this.rtdb, RTDB_SYNC_PATH);
     // Solo escuchar eventos nuevos (después del tiempo de inicio)
     const startTime = this.lastEventTime;
-    
+
     this.rtdbUnsubscribe = onChildAdded(eventsRef, async (snapshot) => {
       const event = snapshot.val();
       if (!event) return;
       if (typeof event.timestamp === 'number' && event.timestamp + RTDB_CLOCK_SKEW_MS < startTime) return;
-      
+
       // Ignorar eventos propios (del worker)
       if (event.source === 'worker') return;
-      
+
       log(`📨 RTDB evento del frontend: ${event.type} ${event.path}`);
-      
+
       // Procesar evento según tipo
       if (event.type === 'refresh') {
         // Frontend solicita refresh completo
@@ -687,29 +686,29 @@ class SyncManager {
           log(`🗑️ Archivo eliminado por evento RTDB: ${event.path}`);
         }
       }
-      
+
       // Limpiar evento procesado (opcional, para no acumular)
       try {
         await remove(snapshot.ref);
       } catch (_e) { /* ignore */ }
     });
-    
+
     log(`✅ Listener de RTDB activo`);
   }
 
   // Descargar documento específico por ID
   async downloadDocumentById(docId) {
     try {
-      const docsRef = collection(this.db, "documents");
-      const docSnapshot = await getDocs(query(docsRef, where("__name__", "==", docId)));
+      const docsRef = collection(this.db, 'documents');
+      const docSnapshot = await getDocs(query(docsRef, where('__name__', '==', docId)));
       if (docSnapshot.empty) return;
-      
+
       const data = docSnapshot.docs[0].data();
       if (!data.storagePath) return;
-      
+
       const localPath = this.getLocalPath(data.storagePath);
       if (!localPath) return;
-      
+
       await this.syncDocumentToLocal(data, localPath);
     } catch (err) {
       log(`⚠️ Error descargando documento ${docId}: ${err.message}`);
@@ -723,17 +722,17 @@ class SyncManager {
   // Listener de Firestore para sincronización bidireccional en tiempo real
   setupFirestoreListener() {
     log(`🔔 Configurando listener de Firestore para ${tokenInfo.workspaceId}...`);
-    
+
     // Flag para ignorar el snapshot inicial (todos los docs aparecen como 'added')
     let isInitialSnapshot = true;
-    
+
     // Query para documentos de este workspace
     let q;
-    const docsRef = collection(this.db, "documents");
+    const docsRef = collection(this.db, 'documents');
     if (tokenInfo.workspaceType === 'personal') {
-      q = query(docsRef, where("ownerId", "==", tokenInfo.userId));
+      q = query(docsRef, where('ownerId', '==', tokenInfo.userId));
     } else {
-      q = query(docsRef, where("workspaceId", "==", tokenInfo.workspaceId));
+      q = query(docsRef, where('workspaceId', '==', tokenInfo.workspaceId));
     }
 
     this.firestoreUnsubscribe = onSnapshot(q,
@@ -744,16 +743,16 @@ class SyncManager {
           log(`📋 Snapshot inicial ignorado (${snapshot.size} documentos)`);
           return;
         }
-        
+
         snapshot.docChanges().forEach(async (change) => {
           const docSnap = change.doc;
           const data = docSnap.data();
-          
+
           if (!data.storagePath) return;
-          
+
           const localPath = this.getLocalPath(data.storagePath);
           if (!localPath) return;
-          
+
           // Evitar procesar cambios que nosotros mismos causamos
           if (this.isRecentLocalChange(localPath)) {
             log(`⏭️ Ignorando cambio propio: ${data.name || docSnap.id}`);
@@ -793,7 +792,7 @@ class SyncManager {
     try {
       // Asegurar que existe la estructura de directorios (subcarpetas)
       this.ensureDirectoryExists(localPath);
-      
+
       // Para archivos de texto, usar el contenido de Firestore
       const ext = getExtLower(localPath);
       if (!isAllowedTextExtension(ext)) {
@@ -808,7 +807,7 @@ class SyncManager {
             return; // Sin cambios
           }
         }
-        
+
         // Escribir contenido
         fs.writeFileSync(localPath, docData.content, 'utf8');
         this.recentDownloads.set(localPath, Date.now());
@@ -842,7 +841,7 @@ class SyncManager {
         fs.unlinkSync(localPath);
         this.untrackLocalFile(localPath);
         log(`🗑️ Archivo local eliminado: ${fileName}`);
-        
+
         // Limpiar directorios padres vacíos recursivamente
         this.cleanupEmptyParentDirs(path.dirname(localPath));
       }
@@ -854,7 +853,7 @@ class SyncManager {
   // Limpiar directorios vacíos recursivamente hacia arriba
   cleanupEmptyParentDirs(dir) {
     if (dir === SYNC_DIR || !dir.startsWith(SYNC_DIR)) return;
-    
+
     try {
       const files = fs.readdirSync(dir);
       if (files.length === 0) {
@@ -890,7 +889,7 @@ class SyncManager {
     let best = null;
     for (const mount of this.mounts) {
       const rel = path.relative(mount.local, localPath);
-      if (!rel || rel.startsWith("..")) continue;
+      if (!rel || rel.startsWith('..')) continue;
       if (!best || mount.local.length > best.local.length) {
         best = { ...mount, rel };
       }
@@ -904,7 +903,7 @@ class SyncManager {
     for (const mount of this.mounts) {
       if (remotePath.startsWith(`${mount.remote}/`)) {
         const rel = remotePath.slice(mount.remote.length + 1);
-        return path.join(mount.local, rel.split("/").join(path.sep));
+        return path.join(mount.local, rel.split('/').join(path.sep));
       }
     }
     return null;
@@ -925,42 +924,42 @@ class SyncManager {
       if (!isAllowedTextExtension(ext)) {
         return;
       }
-      const content = fs.readFileSync(localPath, "utf8");
-      
+      const content = fs.readFileSync(localPath, 'utf8');
+
       const q = query(
-        collection(this.db, "documents"), 
-        where("storagePath", "==", remotePath)
+        collection(this.db, 'documents'),
+        where('storagePath', '==', remotePath)
       );
       const snapshot = await getDocs(q);
-      
+
       if (snapshot.empty) {
         // Crear nuevo documento en Firestore si no existe
         const fileName = path.basename(localPath);
-        
+
         // Calcular el folder basado en la estructura de directorios
         const relPath = path.relative(SYNC_DIR, localPath);
         const dirPath = path.dirname(relPath);
         // Si está en la raíz, usar "No estructurado", sino usar el path de directorio
         const folder = (dirPath === '.' || dirPath === '') ? 'No estructurado' : dirPath.split(path.sep).join('/');
-        
+
         const docData = {
-          name: fileName.replace(/\.[^/.]+$/, ""), // nombre sin extensión
+          name: fileName.replace(/\.[^/.]+$/, ''), // nombre sin extensión
           content,
           storagePath: remotePath,
           workspaceId: tokenInfo.firestoreWorkspaceId,
           ownerId: tokenInfo.userId || tokenInfo.firestoreWorkspaceId,
-          folder: folder,
+          folder,
           createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
+          updatedAt: serverTimestamp()
         };
-        const newDoc = await addDoc(collection(this.db, "documents"), docData);
+        const newDoc = await addDoc(collection(this.db, 'documents'), docData);
         log(`Firestore documento creado: ${newDoc.id} (${fileName}) en carpeta: ${folder}`);
         this.notifyFileChange('created', fileName, newDoc.id);
       } else {
         for (const docSnap of snapshot.docs) {
           await updateDoc(docSnap.ref, {
             content,
-            updatedAt: serverTimestamp(),
+            updatedAt: serverTimestamp()
           });
           log(`Firestore actualizado: ${docSnap.id}`);
           this.notifyFileChange('updated', path.basename(localPath), docSnap.id);
@@ -982,10 +981,10 @@ class SyncManager {
 
     const remotePath = this.getRemotePath(localPath);
     if (!remotePath) return;
-    
+
     const ext = getExtLower(localPath);
     if (!isAllowedTextExtension(ext)) {
-      blockUpload(localPath, "extension no permitida");
+      blockUpload(localPath, 'extension no permitida');
       return;
     }
 
@@ -1016,9 +1015,9 @@ class SyncManager {
       this.trackLocalFile(localPath);
       await this.updateFirestore(remotePath, localPath);
     } catch (err) {
-      if (err && (err.code === "storage/unauthorized" || err.code === "storage/unauthenticated")) {
+      if (err && (err.code === 'storage/unauthorized' || err.code === 'storage/unauthenticated')) {
         log(`⛔ Upload bloqueado: ${path.basename(localPath)} - ${err.code} - ${err.message}`);
-        blockUpload(localPath, "reglas de Storage");
+        blockUpload(localPath, 'reglas de Storage');
         return;
       }
       log(`Error subiendo ${localPath}: ${err.message}`);
@@ -1087,7 +1086,7 @@ class SyncManager {
     } else {
       q = query(collection(this.db, 'documents'), where('workspaceId', '==', tokenInfo.workspaceId));
     }
-    
+
     const snapshot = await getDocs(q);
     snapshot.forEach(docSnap => {
       const data = docSnap.data();
@@ -1101,7 +1100,7 @@ class SyncManager {
         }
       }
     });
-    
+
     return folders;
   }
 
@@ -1119,23 +1118,23 @@ class SyncManager {
   async handleLocalDelete(filePath) {
       const remotePath = this.getRemotePath(filePath);
       if (!remotePath) return;
-      
+
       log(`🗑️ Archivo local eliminado: ${path.basename(filePath)}`);
-      
+
       try {
         const q = query(
-          collection(this.db, "documents"),
-          where("storagePath", "==", remotePath)
+          collection(this.db, 'documents'),
+          where('storagePath', '==', remotePath)
         );
         const snapshot = await getDocs(q);
-        
+
         if (!snapshot.empty) {
           const docSnap = snapshot.docs[0];
           await deleteDoc(docSnap.ref);
           log(`🗑️ Documento Firestore eliminado: ${docSnap.id}`);
           this.notifyFileChange('deleted', path.basename(filePath), docSnap.id);
         }
-        
+
         await this.deleteFromStorage(remotePath, path.basename(filePath));
       } catch (err) {
         log(`❌ Error propagando borrado: ${err.message}`);
@@ -1149,7 +1148,7 @@ class SyncManager {
     try {
       for (const mount of this.mounts) {
         log(`📂 Procesando mount: ${mount.local} -> ${mount.remote}`);
-        
+
         // List remote files recursively
         const mountRef = ref(this.storage, mount.remote);
         const remoteFiles = await this.listRemoteFilesRecursive(mountRef);
@@ -1165,9 +1164,9 @@ class SyncManager {
         if (tokenInfo.workspaceType === 'personal') {
            q = query(collection(this.db, 'documents'), where('ownerId', '==', tokenInfo.userId));
         } else {
-           q = query(collection(this.db, 'documents'), where("workspaceId", "==", tokenInfo.workspaceId));
+           q = query(collection(this.db, 'documents'), where('workspaceId', '==', tokenInfo.workspaceId));
         }
-        
+
         const firestoreDocs = await getDocs(q);
         const firestorePathSet = new Set();
         const firestoreDocsByPath = new Map();
@@ -1194,22 +1193,22 @@ class SyncManager {
         for (const localPath of localFiles) {
           this.trackLocalFile(localPath);
         }
-        
+
         if (localDirs.length > 0) {
           log(`📁 Encontrados ${localDirs.length} directorios locales`);
         }
-        
+
         for (const localPath of localFiles) {
           const remotePath = this.getRemotePath(localPath);
           if (!remotePath) continue;
-          
+
           const ext = getExtLower(localPath);
           const isTextFile = isAllowedTextExtension(ext);
           const existsInFirestore = firestorePathSet.has(remotePath);
           const existsInStorage = remotePathSet.has(remotePath);
-          
+
           if (!isTextFile) {
-            blockUpload(localPath, "extension no permitida");
+            blockUpload(localPath, 'extension no permitida');
             continue;
           }
           if (!existsInFirestore && existsInStorage) {
@@ -1252,7 +1251,7 @@ class SyncManager {
           // Verify if exists in Firestore
           // Note: fileRef.fullPath is the path
           const ext = path.extname(fileRef.name).toLowerCase();
-          
+
           // Check ignoring logic for path? getLocalPath handles it
           const localPath = this.getLocalPath(fileRef.fullPath);
           if (!localPath || isIgnoredPath(localPath)) continue;
@@ -1271,7 +1270,7 @@ class SyncManager {
           }
 
           const localExists = fs.existsSync(localPath);
-          
+
           if (!localExists) {
             if (this.initialSyncDone && this.wasKnownLocally(localPath)) {
               // Deleted locally, propagate delete
@@ -1283,18 +1282,18 @@ class SyncManager {
             await this.downloadFile(fileRef);
             continue;
           }
-          
+
           this.trackLocalFile(localPath);
 
           const localStat = fs.statSync(localPath);
           const localMtimeMs = localStat.mtimeMs;
-          
+
           let remoteUpdatedMs = 0;
           try {
              const metadata = await getMetadata(fileRef);
              const updatedStr = metadata.updated;
              remoteUpdatedMs = updatedStr ? new Date(updatedStr).getTime() : 0;
-          } catch(e) {
+          } catch (e) {
             // Ignore metadata error
           }
 
@@ -1315,7 +1314,7 @@ class SyncManager {
           // Let's skip MD5 for now or check if it exists in metadata object.
           // metadata.md5Hash exists.
         }
-        
+
         if (!this.initialSyncDone) {
           this.initialSyncDone = true;
           log(`✅ Sincronización inicial completada`);
@@ -1354,22 +1353,22 @@ async function run() {
 
   const socket = io(NEXUS_URL, {
     auth: {
-      type: "sync-agent",
+      type: 'sync-agent',
       workerToken: signedToken
     },
     transports: ['websocket'],
     reconnection: true,
     reconnectionDelay: 2000,
-    reconnectionDelayMax: 30000,  // Backoff hasta 30s para no spamear el hub
+    reconnectionDelayMax: 30000, // Backoff hasta 30s para no spamear el hub
     reconnectionAttempts: Infinity,
     randomizationFactor: 0.3
   });
 
-  socket.on("connect", () => {
+  socket.on('connect', () => {
     log(`🔌 Connected to Hub at ${NEXUS_URL}`);
   });
 
-  socket.on("connect_error", (err) => {
+  socket.on('connect_error', (err) => {
     log(`⚠️ Error conectando al Hub: ${err.message}`);
   });
 
@@ -1377,13 +1376,13 @@ async function run() {
     try {
       await signInWithCustomToken(auth, token);
       log(`🔐 Autenticado con Firebase Custom Token`);
-      
+
       const manager = new SyncManager(storage, db, socket, rtdb);
       await manager.loadWorkspaceMounts();
       manager.setupFirestoreListener();
       manager.setupRTDBListener(); // Listener de Realtime Database
-      
-      socket.on("remote-doc-change", async (data) => {
+
+      socket.on('remote-doc-change', async (data) => {
         log(`📨 Evento remoto recibido: ${data.action} ${data.docId || ''}`);
       });
 
@@ -1391,21 +1390,21 @@ async function run() {
         ignoreInitial: true,
         ignored: (filePath) => isIgnoredPath(filePath),
         usePolling: true,
-        interval: 2000,           // Reducido de 5s a 2s para detectar cambios más rápido
-        binaryInterval: 5000,     // Reducido de 10s a 5s
+        interval: 2000, // Reducido de 5s a 2s para detectar cambios más rápido
+        binaryInterval: 5000, // Reducido de 10s a 5s
         awaitWriteFinish: { stabilityThreshold: 1000, pollInterval: 200 }
       });
 
       // ── Rename-aware file handlers ──
-      watcher.on("add", async (fp) => {
+      watcher.on('add', async (fp) => {
         // Primero intentar match con un delete pendiente (rename)
         const wasRenamed = await manager.tryMatchRename(fp);
         if (!wasRenamed) {
           manager.uploadFile(fp);
         }
       });
-      watcher.on("change", (fp) => manager.uploadFile(fp));
-      watcher.on("unlink", (fp) => {
+      watcher.on('change', (fp) => manager.uploadFile(fp));
+      watcher.on('unlink', (fp) => {
         // Buffer el delete para dar tiempo a detectar rename
         if (manager.initialSyncDone) {
           manager.bufferDelete(fp);
@@ -1416,12 +1415,12 @@ async function run() {
 
       // ── Rename-aware directory handlers ──
       const pendingDirDeletes = new Map(); // Para detectar rename de carpetas
-      
-      watcher.on("addDir", (fp) => {
+
+      watcher.on('addDir', (fp) => {
         if (fp === SYNC_DIR || isIgnoredPath(fp)) return;
         const relPath = path.relative(SYNC_DIR, fp);
         log(`📁 Nueva carpeta detectada: ${relPath}`);
-        
+
         // Verificar si es rename de una carpeta eliminada recientemente
         for (const [oldDir, info] of pendingDirDeletes.entries()) {
           if (Date.now() - info.ts < RENAME_WINDOW_MS) {
@@ -1441,12 +1440,12 @@ async function run() {
           }
         }
       });
-      
-      watcher.on("unlinkDir", (fp) => {
+
+      watcher.on('unlinkDir', (fp) => {
         if (fp === SYNC_DIR || isIgnoredPath(fp)) return;
         const relPath = path.relative(SYNC_DIR, fp);
         log(`⏳ Carpeta eliminada (esperando rename): ${relPath}`);
-        
+
         pendingDirDeletes.set(fp, {
           ts: Date.now(),
           timer: setTimeout(() => {
@@ -1475,7 +1474,7 @@ async function run() {
       process.on('SIGTERM', () => handleSignal('SIGTERM'));
       process.on('SIGINT', () => handleSignal('SIGINT'));
 
-    } catch(e) {
+    } catch (e) {
       log(`❌ Error fatal iniciando sync: ${e.message}`);
     }
   });
