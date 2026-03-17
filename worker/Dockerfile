@@ -19,6 +19,8 @@ RUN apt-get update && apt-get install -y \
     unzip \
     zip \
     jq \
+    file \
+    man-db \
     # Network tools
     net-tools \
     iputils-ping \
@@ -41,8 +43,15 @@ RUN apt-get update && apt-get install -y \
     bat \
     # File management
     rsync \
+    rename \
+    # Python
+    python3 \
+    python3-pip \
+    python3-venv \
     # Locales for proper encoding
     locales \
+    # Terminal enhancements
+    bash-completion \
     && rm -rf /var/lib/apt/lists/*
 
 # Generate locale
@@ -58,6 +67,13 @@ RUN mkdir -p /etc/apt/keyrings && \
     apt-get update && apt-get install -y nodejs && \
     rm -rf /var/lib/apt/lists/*
 
+# Install eza (modern ls replacement with colors + icons)
+RUN mkdir -p /etc/apt/keyrings && \
+    wget -qO- https://raw.githubusercontent.com/eza-community/eza/main/deb.asc | gpg --dearmor -o /etc/apt/keyrings/gierens.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/gierens.gpg] http://deb.gierens.de stable main" | tee /etc/apt/sources.list.d/gierens.list && \
+    apt-get update && apt-get install -y eza && \
+    rm -rf /var/lib/apt/lists/* || true
+
 # Install global npm packages
 RUN npm install -g \
     pnpm \
@@ -70,12 +86,31 @@ RUN npm install -g \
 
 # Create symlinks for better command names
 RUN ln -sf /usr/bin/fdfind /usr/bin/fd && \
-    ln -sf /usr/bin/batcat /usr/bin/bat 2>/dev/null || true
+    ln -sf /usr/bin/batcat /usr/bin/bat 2>/dev/null || true && \
+    ln -sf /usr/bin/python3 /usr/bin/python 2>/dev/null || true
 
 # Create estudiante user with sudo privileges (passwordless)
 RUN useradd -m -s /bin/bash estudiante && \
     echo "estudiante ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers && \
     usermod -aG sudo estudiante
+
+# ── Enhanced shell configuration ──────────────────────────────────
+# Copy shell config and append to global bashrc
+COPY shell-config/bashrc-extra.sh /tmp/bashrc-extra.sh
+RUN cat /tmp/bashrc-extra.sh >> /etc/bash.bashrc && rm /tmp/bashrc-extra.sh
+
+# Ensure the estudiante user's .bashrc sources the global config
+RUN echo '' >> /home/estudiante/.bashrc && \
+    echo '# Source global bashrc for enhanced shell' >> /home/estudiante/.bashrc && \
+    echo 'if [ -f /etc/bash.bashrc ]; then . /etc/bash.bashrc; fi' >> /home/estudiante/.bashrc
+
+# Configure git defaults
+RUN git config --system color.ui auto && \
+    git config --system init.defaultBranch main && \
+    git config --system core.autocrlf input
+
+# Create /workspace with proper permissions
+RUN mkdir -p /workspace && chown estudiante:estudiante /workspace
 
 WORKDIR /app
 

@@ -41,7 +41,13 @@ const POLL_INTERVAL_MS = (() => {
 })();
 const CLOCK_SKEW_MS = 2000;
 const RTDB_CLOCK_SKEW_MS = 2 * 60 * 1000;
-const DOWNLOAD_GRACE_MS = 15000; // Aumentado a 15s para dar margen al polling de Chokidar (5s) + latencia
+const DOWNLOAD_GRACE_MS = 15000;
+
+// ── Rename detection ─────────────────────────────────────────────────
+const RENAME_WINDOW_MS = 3000;   // Ventana para detectar unlink→add como rename
+const DELETE_DEBOUNCE_MS = 2500; // Debounce deletes para dar tiempo a detectar rename
+const BATCH_DEBOUNCE_MS = 1500;  // Debounce para batch de operaciones (move carpeta)
+const MAX_PENDING_DELETES = 200; // Límite de deletes pendientes en buffer
 
 if (!WORKER_SECRET) {
   console.error("❌ WORKER_SECRET is required.");
@@ -95,6 +101,7 @@ const IGNORE_LIST = new Set([".git", ".DS_Store", "node_modules", ".next", "repo
 // ── .syncignore support ──────────────────────────────────────────────
 const SYNCIGNORE_FILE = path.join(SYNC_DIR, ".syncignore");
 let syncIgnorePatterns = new Set();   // dynamic set loaded from .syncignore
+let syncIgnoreRegexes = [];           // pre-compiled regex cache for wildcard patterns
 
 function loadSyncIgnore() {
   try {
@@ -109,6 +116,10 @@ function loadSyncIgnore() {
       if (pattern) newPatterns.add(pattern);
     }
     syncIgnorePatterns = newPatterns;
+    // Pre-compile wildcard patterns once so isIgnoredPath doesn't recompile on every call
+    syncIgnoreRegexes = [...newPatterns]
+      .filter(p => p.includes("*"))
+      .map(p => new RegExp("^" + p.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$"));
     log(`📋 .syncignore cargado: ${newPatterns.size} patrones → [${[...newPatterns].join(", ")}]`);
   } catch (err) {
     log(`⚠️  Error leyendo .syncignore: ${err.message}`);
@@ -218,12 +229,9 @@ function isIgnoredPath(filePath) {
     if (IGNORE_LIST.has(part)) return true;
     // Check dynamic .syncignore patterns
     if (syncIgnorePatterns.has(part)) return true;
-    // Support simple wildcard matching (e.g., *.pyc, *.o)
-    for (const pattern of syncIgnorePatterns) {
-      if (pattern.includes("*")) {
-        const regex = new RegExp("^" + pattern.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$");
-        if (regex.test(part)) return true;
-      }
+    // Support simple wildcard matching using pre-compiled regexes (e.g., *.pyc, *.o)
+    for (const regex of syncIgnoreRegexes) {
+      if (regex.test(part)) return true;
     }
   }
   return false;
@@ -288,6 +296,12 @@ class SyncManager {
     this.isShuttingDown = false; // Flag de apagado
     this.lastEventTime = Date.now(); // Para filtrar eventos antiguos
 
+    // ── Rename detection state ──
+    this.pendingDeletes = new Map();  // localPath → { timer, remotePath, docId, content, hash, ts }
+    this.pendingAdds = new Map();     // localPath → { timer, ts }
+    this.renameBatchTimer = null;
+    this.pendingFolderRenames = new Map(); // oldDir -> newDir
+
     this.mounts.push({
       local: SYNC_DIR,
       remote: tokenInfo.storagePath,
@@ -334,6 +348,268 @@ class SyncManager {
   isRecentLocalChange(localPath) {
     this.cleanupLocalChanges();
     return this.recentLocalChanges.has(localPath);
+  }
+
+  // ── Rename detection: buffered delete ──────────────────────────────
+  // En lugar de borrar inmediatamente, bufferizar el delete y esperar a ver si llega un add
+  // con el mismo contenido/hash (rename) dentro de RENAME_WINDOW_MS.
+  trimPendingDeletesIfNeeded() {
+    while (this.pendingDeletes.size >= MAX_PENDING_DELETES) {
+      const oldestEntry = this.pendingDeletes.entries().next().value;
+      if (!oldestEntry) return;
+      const [oldLocalPath, pending] = oldestEntry;
+
+      clearTimeout(pending.timer);
+      this.pendingDeletes.delete(oldLocalPath);
+      log(`⚠️ Límite de deletes pendientes (${MAX_PENDING_DELETES}) alcanzado; forzando delete: ${path.basename(oldLocalPath)}`);
+      this.executeDelete(oldLocalPath, pending.remotePath, pending.docId)
+        .catch((err) => log(`❌ Error forzando delete pendiente: ${err.message}`));
+    }
+  }
+
+  async bufferDelete(localPath) {
+    if (this.isShuttingDown) return;
+    const remotePath = this.getRemotePath(localPath);
+    if (!remotePath) return;
+
+    // Capturar info del doc de Firestore ANTES de borrarlo
+    let docId = null;
+    let docData = null;
+    let contentHash = null;
+    try {
+      const q = query(
+        collection(this.db, "documents"),
+        where("storagePath", "==", remotePath)
+      );
+      const snapshot = await getDocs(q);
+      if (!snapshot.empty) {
+        const docSnap = snapshot.docs[0];
+        docId = docSnap.id;
+        docData = docSnap.data();
+        // Hash del contenido para matching
+        if (docData.content) {
+          contentHash = crypto.createHash('md5').update(docData.content).digest('hex');
+        }
+      }
+    } catch (err) {
+      log(`⚠️ Error capturando info para rename-detect: ${err.message}`);
+    }
+
+    this.trimPendingDeletesIfNeeded();
+
+    const pending = {
+      remotePath,
+      docId,
+      docData,
+      contentHash,
+      ts: Date.now(),
+      timer: setTimeout(() => {
+        // No se detectó rename → ejecutar delete real
+        this.pendingDeletes.delete(localPath);
+        this.executeDelete(localPath, remotePath, docId);
+      }, DELETE_DEBOUNCE_MS)
+    };
+    this.pendingDeletes.set(localPath, pending);
+    log(`⏳ Delete bufferizado (esperando rename): ${path.basename(localPath)}`);
+  }
+
+  // Ejecutar delete real después del debounce
+  async executeDelete(localPath, remotePath, docId) {
+    log(`🗑️ Ejecutando delete: ${path.basename(localPath)}`);
+    try {
+      if (docId) {
+        const docRef = collection(this.db, "documents");
+        const q = query(docRef, where("__name__", "==", docId));
+        const snap = await getDocs(q);
+        if (!snap.empty) {
+          await deleteDoc(snap.docs[0].ref);
+          log(`🗑️ Firestore eliminado: ${docId}`);
+          this.notifyFileChange('deleted', path.basename(localPath), docId);
+        }
+      } else {
+        // Fallback: buscar por storagePath
+        await this.handleLocalDelete(localPath);
+      }
+      await this.deleteFromStorage(remotePath, path.basename(localPath));
+    } catch (err) {
+      log(`❌ Error en delete definitivo: ${err.message}`);
+    }
+    this.untrackLocalFile(localPath);
+  }
+
+  // Cuando llega un ADD, verificar si es un rename de un delete pendiente
+  async tryMatchRename(newLocalPath) {
+    if (this.pendingDeletes.size === 0) return false;
+    if (!fs.existsSync(newLocalPath)) return false;
+
+    const ext = getExtLower(newLocalPath);
+    if (!isAllowedTextExtension(ext)) return false;
+
+    let newContent;
+    try {
+      newContent = fs.readFileSync(newLocalPath, 'utf8');
+    } catch { return false; }
+
+    const newHash = crypto.createHash('md5').update(newContent).digest('hex');
+
+    // Buscar un delete pendiente con el mismo hash de contenido
+    for (const [oldPath, pending] of this.pendingDeletes.entries()) {
+      if (!pending.contentHash) continue;
+      if (pending.contentHash !== newHash) continue;
+      if (Date.now() - pending.ts > RENAME_WINDOW_MS) continue;
+
+      // ¡Match! Es un rename
+      clearTimeout(pending.timer);
+      this.pendingDeletes.delete(oldPath);
+
+      log(`🔄 RENAME detectado: ${path.basename(oldPath)} → ${path.basename(newLocalPath)}`);
+
+      // Actualizar Firestore doc en lugar de delete+create
+      const newRemotePath = this.getRemotePath(newLocalPath);
+      if (!newRemotePath || !pending.docId) {
+        // Fallback: upload normal
+        await this.uploadFile(newLocalPath);
+        return true;
+      }
+
+      try {
+        // Calcular nuevo folder
+        const relPath = path.relative(SYNC_DIR, newLocalPath);
+        const dirPath = path.dirname(relPath);
+        const newFolder = (dirPath === '.' || dirPath === '') ? 'No estructurado' : dirPath.split(path.sep).join('/');
+        const newName = path.basename(newLocalPath).replace(/\.[^/.]+$/, "");
+
+        // Actualizar doc existente con nuevo path y nombre
+        const q = query(collection(this.db, "documents"), where("__name__", "==", pending.docId));
+        const snap = await getDocs(q);
+        if (!snap.empty) {
+          await updateDoc(snap.docs[0].ref, {
+            name: newName,
+            storagePath: newRemotePath,
+            folder: newFolder,
+            updatedAt: serverTimestamp()
+          });
+          log(`✅ Firestore actualizado (rename): ${pending.docId} → ${newName} en ${newFolder}`);
+        }
+
+        // Mover en Storage: subir a nuevo path, borrar viejo
+        const content = fs.readFileSync(newLocalPath);
+        const contentType = getContentTypeForExt(ext);
+        const newFileRef = ref(this.storage, newRemotePath);
+        await uploadBytes(newFileRef, content, { contentType });
+
+        // Borrar viejo de Storage
+        try {
+          const oldFileRef = ref(this.storage, pending.remotePath);
+          await deleteObject(oldFileRef);
+        } catch (e) {
+          if (e.code !== 'storage/object-not-found') log(`⚠️ No se pudo borrar viejo de Storage: ${e.message}`);
+        }
+
+        this.markLocalChange(newLocalPath);
+        this.trackLocalFile(newLocalPath);
+        this.notifyFileChange('updated', path.basename(newLocalPath), pending.docId, newFolder);
+        log(`✅ Rename completado: ${path.basename(oldPath)} → ${path.basename(newLocalPath)}`);
+      } catch (err) {
+        log(`❌ Error procesando rename, fallback a upload: ${err.message}`);
+        await this.uploadFile(newLocalPath);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  queueFolderRename(oldDir, newDir) {
+    if (this.isShuttingDown) return;
+    this.pendingFolderRenames.set(oldDir, newDir);
+
+    if (this.renameBatchTimer) {
+      clearTimeout(this.renameBatchTimer);
+    }
+
+    this.renameBatchTimer = setTimeout(async () => {
+      const queuedRenames = Array.from(this.pendingFolderRenames.entries());
+      this.pendingFolderRenames.clear();
+      this.renameBatchTimer = null;
+
+      for (const [fromDir, toDir] of queuedRenames) {
+        await this.handleFolderRename(fromDir, toDir);
+      }
+    }, BATCH_DEBOUNCE_MS);
+  }
+
+  // Detectar rename de carpeta completa: múltiples deletes + adds con misma estructura
+  async handleFolderRename(oldDir, newDir) {
+    log(`📁 RENAME de carpeta detectado: ${path.relative(SYNC_DIR, oldDir)} → ${path.relative(SYNC_DIR, newDir)}`);
+    
+    const oldRelPath = path.relative(SYNC_DIR, oldDir);
+    const newRelPath = path.relative(SYNC_DIR, newDir);
+    
+    try {
+      // Actualizar todos los docs de Firestore que tengan folder con el path viejo
+      let q;
+      if (tokenInfo.workspaceType === 'personal') {
+        q = query(collection(this.db, 'documents'), where('ownerId', '==', tokenInfo.userId));
+      } else {
+        q = query(collection(this.db, 'documents'), where('workspaceId', '==', tokenInfo.workspaceId));
+      }
+      
+      const snapshot = await getDocs(q);
+      let updated = 0;
+      
+      for (const docSnap of snapshot.docs) {
+        const data = docSnap.data();
+        if (!data.folder || !data.storagePath) continue;
+        
+        // Verificar si el folder empieza con el path viejo
+        if (data.folder === oldRelPath || data.folder.startsWith(oldRelPath + '/')) {
+          const newFolder = data.folder.replace(oldRelPath, newRelPath);
+          const newStoragePath = data.storagePath.replace(
+            `${tokenInfo.storagePath}/${oldRelPath}`,
+            `${tokenInfo.storagePath}/${newRelPath}`
+          );
+          
+          await updateDoc(docSnap.ref, {
+            folder: newFolder,
+            storagePath: newStoragePath,
+            updatedAt: serverTimestamp()
+          });
+          
+          // Mover en Storage
+          try {
+            const oldRef = ref(this.storage, data.storagePath);
+            const buffer = await getBytes(oldRef);
+            const newRef = ref(this.storage, newStoragePath);
+            const ext = path.extname(data.name || '').toLowerCase();
+            await uploadBytes(newRef, buffer, { contentType: getContentTypeForExt(ext) });
+            await deleteObject(oldRef);
+          } catch (e) {
+            if (e.code !== 'storage/object-not-found') {
+              log(`⚠️ Error moviendo en Storage: ${e.message}`);
+            }
+          }
+          
+          updated++;
+        }
+      }
+      
+      log(`✅ Carpeta renombrada: ${updated} documentos actualizados`);
+    } catch (err) {
+      log(`❌ Error en folder rename: ${err.message}`);
+    }
+  }
+
+  // Cancelar todos los deletes pendientes (usado en shutdown)
+  cancelPendingDeletes() {
+    for (const [, pending] of this.pendingDeletes) {
+      clearTimeout(pending.timer);
+    }
+    this.pendingDeletes.clear();
+    this.pendingFolderRenames.clear();
+    if (this.renameBatchTimer) {
+      clearTimeout(this.renameBatchTimer);
+      this.renameBatchTimer = null;
+    }
   }
 
   // Publicar evento a RTDB para notificar cambios en tiempo real
@@ -1057,8 +1333,12 @@ class SyncManager {
   async shutdown() {
     this.isShuttingDown = true;
     log('🛑 Iniciando apagado seguro...');
+    this.cancelPendingDeletes();
     if (this.firestoreUnsubscribe) {
         this.firestoreUnsubscribe();
+    }
+    if (this.rtdbUnsubscribe) {
+        this.rtdbUnsubscribe();
     }
     if (this.socket) {
         this.socket.disconnect();
@@ -1076,11 +1356,14 @@ async function run() {
     auth: {
       type: "sync-agent",
       workerToken: signedToken
-      // secret: WORKER_SECRET // REMOVED: No longer sending raw secret
     },
     transports: ['websocket'],
     reconnection: true,
-});
+    reconnectionDelay: 2000,
+    reconnectionDelayMax: 30000,  // Backoff hasta 30s para no spamear el hub
+    reconnectionAttempts: Infinity,
+    randomizationFactor: 0.3
+  });
 
   socket.on("connect", () => {
     log(`🔌 Connected to Hub at ${NEXUS_URL}`);
@@ -1108,25 +1391,69 @@ async function run() {
         ignoreInitial: true,
         ignored: (filePath) => isIgnoredPath(filePath),
         usePolling: true,
-        interval: 5000,
-        binaryInterval: 10000,
-        awaitWriteFinish: { stabilityThreshold: 2000, pollInterval: 100 }
+        interval: 2000,           // Reducido de 5s a 2s para detectar cambios más rápido
+        binaryInterval: 5000,     // Reducido de 10s a 5s
+        awaitWriteFinish: { stabilityThreshold: 1000, pollInterval: 200 }
       });
 
-      watcher.on("add", (fp) => manager.uploadFile(fp));
-      watcher.on("change", (fp) => manager.uploadFile(fp));
-      watcher.on("unlink", (fp) => manager.handleLocalDelete(fp));
-      watcher.on("addDir", (fp) => {
-        if (fp !== SYNC_DIR && !isIgnoredPath(fp)) {
-          const relPath = path.relative(SYNC_DIR, fp);
-          log(`📁 Nueva carpeta detectada: ${relPath}`);
+      // ── Rename-aware file handlers ──
+      watcher.on("add", async (fp) => {
+        // Primero intentar match con un delete pendiente (rename)
+        const wasRenamed = await manager.tryMatchRename(fp);
+        if (!wasRenamed) {
+          manager.uploadFile(fp);
         }
       });
-      watcher.on("unlinkDir", (fp) => {
-        if (fp !== SYNC_DIR && !isIgnoredPath(fp)) {
-          const relPath = path.relative(SYNC_DIR, fp);
-          log(`🗑️ Carpeta eliminada: ${relPath}`);
+      watcher.on("change", (fp) => manager.uploadFile(fp));
+      watcher.on("unlink", (fp) => {
+        // Buffer el delete para dar tiempo a detectar rename
+        if (manager.initialSyncDone) {
+          manager.bufferDelete(fp);
+        } else {
+          manager.handleLocalDelete(fp);
         }
+      });
+
+      // ── Rename-aware directory handlers ──
+      const pendingDirDeletes = new Map(); // Para detectar rename de carpetas
+      
+      watcher.on("addDir", (fp) => {
+        if (fp === SYNC_DIR || isIgnoredPath(fp)) return;
+        const relPath = path.relative(SYNC_DIR, fp);
+        log(`📁 Nueva carpeta detectada: ${relPath}`);
+        
+        // Verificar si es rename de una carpeta eliminada recientemente
+        for (const [oldDir, info] of pendingDirDeletes.entries()) {
+          if (Date.now() - info.ts < RENAME_WINDOW_MS) {
+            // Cancelar el timer de delete de la carpeta vieja
+            clearTimeout(info.timer);
+            pendingDirDeletes.delete(oldDir);
+            // Cancelar todos los deletes pendientes de archivos dentro de esa carpeta
+            for (const [delPath, pending] of manager.pendingDeletes.entries()) {
+              if (delPath.startsWith(oldDir + path.sep)) {
+                clearTimeout(pending.timer);
+                manager.pendingDeletes.delete(delPath);
+              }
+            }
+            // Procesar como rename de carpeta
+            manager.queueFolderRename(oldDir, fp);
+            return;
+          }
+        }
+      });
+      
+      watcher.on("unlinkDir", (fp) => {
+        if (fp === SYNC_DIR || isIgnoredPath(fp)) return;
+        const relPath = path.relative(SYNC_DIR, fp);
+        log(`⏳ Carpeta eliminada (esperando rename): ${relPath}`);
+        
+        pendingDirDeletes.set(fp, {
+          ts: Date.now(),
+          timer: setTimeout(() => {
+            pendingDirDeletes.delete(fp);
+            log(`🗑️ Carpeta eliminada definitivamente: ${relPath}`);
+          }, RENAME_WINDOW_MS)
+        });
       });
 
       log(`Escuchando cambios en ${SYNC_DIR}`);
