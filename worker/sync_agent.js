@@ -215,7 +215,8 @@ const ALLOWED_TEXT_EXTS = new Set([
   '.scss',
   '.less',
   '.ini',
-  '.log'
+  '.log',
+  '.st'
 ]);
 
 const CONTENT_TYPE_BY_EXT = new Map([
@@ -232,7 +233,8 @@ const CONTENT_TYPE_BY_EXT = new Map([
   ['.scss', 'text/x-scss'],
   ['.less', 'text/x-less'],
   ['.ini', 'text/plain'],
-  ['.log', 'text/plain']
+  ['.log', 'text/plain'],
+  ['.st', 'text/plain']
 ]);
 
 const BLOCKED_UPLOAD_TTL_MS = 10 * 60 * 1000;
@@ -504,7 +506,7 @@ class SyncManager {
 
     let newContent;
     try {
-      newContent = fs.readFileSync(newLocalPath, 'utf8');
+      newContent = await fs.promises.readFile(newLocalPath, 'utf8');
     } catch { return false; }
 
     const newHash = crypto.createHash('md5').update(newContent).digest('hex');
@@ -550,7 +552,7 @@ class SyncManager {
         }
 
         // Mover en Storage: subir a nuevo path, borrar viejo
-        const content = fs.readFileSync(newLocalPath);
+        const content = await fs.promises.readFile(newLocalPath);
         const contentType = getContentTypeForExt(ext);
         const newFileRef = ref(this.storage, newRemotePath);
         await uploadBytes(newFileRef, content, { contentType });
@@ -603,12 +605,24 @@ class SyncManager {
     const newRelPath = path.relative(SYNC_DIR, newDir);
 
     try {
-      // Actualizar todos los docs de Firestore que tengan folder con el path viejo
+      // Usar range query para evitar cargar todos los docs del workspace (O(n) → O(k)).
+      // Firestore soporta igualdad + range en campos distintos.
+      const FOLDER_RANGE_SUFFIX = '\uffff';
       let q;
       if (tokenInfo.workspaceType === 'personal') {
-        q = query(collection(this.db, 'documents'), where('ownerId', '==', tokenInfo.userId));
+        q = query(
+          collection(this.db, 'documents'),
+          where('ownerId', '==', tokenInfo.userId),
+          where('folder', '>=', oldRelPath),
+          where('folder', '<=', oldRelPath + FOLDER_RANGE_SUFFIX)
+        );
       } else {
-        q = query(collection(this.db, 'documents'), where('workspaceId', '==', tokenInfo.workspaceId));
+        q = query(
+          collection(this.db, 'documents'),
+          where('workspaceId', '==', tokenInfo.workspaceId),
+          where('folder', '>=', oldRelPath),
+          where('folder', '<=', oldRelPath + FOLDER_RANGE_SUFFIX)
+        );
       }
 
       const snapshot = await getDocs(q);
@@ -618,7 +632,7 @@ class SyncManager {
         const data = docSnap.data();
         if (!data.folder || !data.storagePath) continue;
 
-        // Verificar si el folder empieza con el path viejo
+        // Verificar si el folder empieza con el path viejo (la range query ya pre-filtra)
         if (data.folder === oldRelPath || data.folder.startsWith(`${oldRelPath}/`)) {
           const newFolder = data.folder.replace(oldRelPath, newRelPath);
           const newStoragePath = data.storagePath.replace(
@@ -802,31 +816,33 @@ class SyncManager {
           return;
         }
 
-        snapshot.docChanges().forEach(async (change) => {
-          const docSnap = change.doc;
-          const data = docSnap.data();
+        (async () => {
+          for (const change of snapshot.docChanges()) {
+            const docSnap = change.doc;
+            const data = docSnap.data();
 
-          if (!data.storagePath) return;
+            if (!data.storagePath) continue;
 
-          const localPath = this.getLocalPath(data.storagePath);
-          if (!localPath) return;
+            const localPath = this.getLocalPath(data.storagePath);
+            if (!localPath) continue;
 
-          // Evitar procesar cambios que nosotros mismos causamos
-          if (this.isRecentLocalChange(localPath)) {
-            log(`⏭️ Ignorando cambio propio: ${data.name || docSnap.id}`);
-            return;
+            // Evitar procesar cambios que nosotros mismos causamos
+            if (this.isRecentLocalChange(localPath)) {
+              log(`⏭️ Ignorando cambio propio: ${data.name || docSnap.id}`);
+              continue;
+            }
+
+            if (change.type === 'added' || change.type === 'modified') {
+              // Descargar/actualizar archivo desde Firebase
+              log(`📨 Firestore: ${change.type} ${data.name || docSnap.id}`);
+              await this.syncDocumentToLocal(data, localPath);
+            } else if (change.type === 'removed') {
+              // Borrar archivo local cuando se borra de Firebase
+              log(`📨 Firestore: removed ${data.name || docSnap.id}`);
+              await this.deleteLocalFile(localPath, data.name || docSnap.id);
+            }
           }
-
-          if (change.type === 'added' || change.type === 'modified') {
-            // Descargar/actualizar archivo desde Firebase
-            log(`📨 Firestore: ${change.type} ${data.name || docSnap.id}`);
-            await this.syncDocumentToLocal(data, localPath);
-          } else if (change.type === 'removed') {
-            // Borrar archivo local cuando se borra de Firebase
-            log(`📨 Firestore: removed ${data.name || docSnap.id}`);
-            await this.deleteLocalFile(localPath, data.name || docSnap.id);
-          }
-        });
+        })().catch(err => log(`❌ Error procesando cambios de Firestore: ${err.message}`));
       },
       (error) => {
         log(`❌ Error en listener de Firestore: ${error.message}`);
@@ -878,7 +894,7 @@ class SyncManager {
         // Verificar si el contenido local es diferente
         if (fs.existsSync(localPath)) {
           try {
-            const localContent = fs.readFileSync(localPath, 'utf8');
+            const localContent = await fs.promises.readFile(localPath, 'utf8');
             if (localContent === docData.content) {
               return; // Sin cambios
             }
@@ -886,7 +902,7 @@ class SyncManager {
             if (readErr.code === 'EACCES') {
               log(`🔧 EACCES leyendo ${path.basename(localPath)}, reparando...`);
               fixOwnership(localPath);
-              const localContent = fs.readFileSync(localPath, 'utf8');
+              const localContent = await fs.promises.readFile(localPath, 'utf8');
               if (localContent === docData.content) return;
             } else {
               throw readErr;
@@ -946,8 +962,8 @@ class SyncManager {
   }
 
   // Limpiar directorios vacíos recursivamente hacia arriba
-  cleanupEmptyParentDirs(dir) {
-    if (dir === SYNC_DIR || !dir.startsWith(SYNC_DIR)) return;
+  cleanupEmptyParentDirs(dir, depth = 0) {
+    if (depth >= 50 || dir === SYNC_DIR || !dir.startsWith(SYNC_DIR)) return;
 
     try {
       const files = fs.readdirSync(dir);
@@ -956,7 +972,7 @@ class SyncManager {
         const relPath = path.relative(SYNC_DIR, dir);
         log(`🗑️ Directorio vacío eliminado: ${relPath}`);
         // Recursivamente limpiar el padre
-        this.cleanupEmptyParentDirs(path.dirname(dir));
+        this.cleanupEmptyParentDirs(path.dirname(dir), depth + 1);
       }
     } catch (_err) {
       // Ignorar errores al limpiar directorios
@@ -1019,7 +1035,7 @@ class SyncManager {
       if (!isAllowedTextExtension(ext)) {
         return;
       }
-      const content = fs.readFileSync(localPath, 'utf8');
+      const content = await fs.promises.readFile(localPath, 'utf8');
 
       const q = query(
         collection(this.db, 'documents'),
@@ -1103,7 +1119,7 @@ class SyncManager {
         }
       }
 
-      const content = fs.readFileSync(localPath);
+      const content = await fs.promises.readFile(localPath);
       const contentType = getContentTypeForExt(ext);
       await uploadBytes(fileRef, content, { contentType });
       log(`Subido: ${path.basename(localPath)} (${contentType})`);
@@ -1450,10 +1466,52 @@ class SyncManager {
     }
   }
 
+  // Limpieza periódica de Maps para evitar memory leaks en procesos de larga ejecución
+  startPeriodicCleanup() {
+    this._cleanupIntervalId = setInterval(() => {
+      const now = Date.now();
+
+      // Limpiar recentDownloads vencidos
+      for (const [filePath, ts] of this.recentDownloads.entries()) {
+        if (now - ts > DOWNLOAD_GRACE_MS) {
+          this.recentDownloads.delete(filePath);
+        }
+      }
+
+      // Limpiar recentLocalChanges vencidos
+      for (const [filePath, ts] of this.recentLocalChanges.entries()) {
+        if (now - ts > 5000) {
+          this.recentLocalChanges.delete(filePath);
+        }
+      }
+
+      // Limpiar blockedUploads vencidos
+      for (const [localPath, entry] of blockedUploads.entries()) {
+        if (now - entry.ts > BLOCKED_UPLOAD_TTL_MS) {
+          blockedUploads.delete(localPath);
+        }
+      }
+
+      // Limpiar knownLocalFiles con archivos que ya no existen en disco
+      for (const localPath of this.knownLocalFiles) {
+        if (!fs.existsSync(localPath)) {
+          this.knownLocalFiles.delete(localPath);
+        }
+      }
+
+      if (process.env.NODE_ENV !== 'production') {
+        log(`🧹 Limpieza periódica: downloads=${this.recentDownloads.size} localChanges=${this.recentLocalChanges.size} knownFiles=${this.knownLocalFiles.size} blocked=${blockedUploads.size}`);
+      }
+    }, 5 * 60 * 1000); // Cada 5 minutos
+  }
+
   async shutdown() {
     this.isShuttingDown = true;
     log('🛑 Iniciando apagado seguro...');
     this.cancelPendingDeletes();
+    if (this._cleanupIntervalId) {
+      clearInterval(this._cleanupIntervalId);
+    }
     if (this.firestoreUnsubscribe) {
         this.firestoreUnsubscribe();
     }
@@ -1533,6 +1591,7 @@ async function run() {
       await manager.loadWorkspaceMounts();
       manager.setupFirestoreListener();
       manager.setupRTDBListener(); // Listener de Realtime Database
+      manager.startPeriodicCleanup(); // Limpieza periódica de Maps
 
       socket.on('remote-doc-change', async (data) => {
         log(`📨 Evento remoto recibido: ${data.action} ${data.docId || ''}`);
@@ -1541,9 +1600,7 @@ async function run() {
       const watcher = chokidar.watch(SYNC_DIR, {
         ignoreInitial: true,
         ignored: (filePath) => isIgnoredPath(filePath),
-        usePolling: true,
-        interval: 2000, // Reducido de 5s a 2s para detectar cambios más rápido
-        binaryInterval: 5000, // Reducido de 10s a 5s
+        usePolling: false,
         awaitWriteFinish: { stabilityThreshold: 1000, pollInterval: 200 }
       });
 
