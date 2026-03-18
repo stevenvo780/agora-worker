@@ -83,7 +83,7 @@ RUN npm install -g \
     nodemon \
     live-server \
     http-server \
-    @stevenvo780/st-lang@latest
+    @stevenvo780/st-lang@2.0.0
 
 # Create symlinks for better command names
 RUN ln -sf /usr/bin/fdfind /usr/bin/fd && \
