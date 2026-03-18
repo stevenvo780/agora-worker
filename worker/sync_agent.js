@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import { execSync } from 'child_process';
 import chokidar from 'chokidar';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInWithCustomToken } from 'firebase/auth';
@@ -96,7 +97,56 @@ if (!WORKER_TOKEN) {
   process.exit(1);
 }
 
-const IGNORE_LIST = new Set(['.git', '.DS_Store', 'node_modules', '.next', 'repos']);
+const IGNORE_LIST = new Set(['.git', '.DS_Store', 'node_modules', '.next', 'repos', '.st-guide.md']);
+
+// ── Ownership repair ─────────────────────────────────────────────────
+const SYNC_USER = process.env.SYNC_USER || 'estudiante';
+
+/**
+ * Fix ownership of a file/directory to SYNC_USER.
+ * Returns true if fix was applied, false if not needed or failed.
+ */
+function fixOwnership(targetPath) {
+  try {
+    const stat = fs.statSync(targetPath);
+    const processUid = process.getuid ? process.getuid() : -1;
+    // If file is not owned by current process user, try to chown
+    if (stat.uid !== processUid) {
+      // Use sudo since estudiante has NOPASSWD sudo in Docker container
+      execSync(`sudo chown ${SYNC_USER}:${SYNC_USER} "${targetPath}"`, { stdio: 'ignore' });
+      return true;
+    }
+  } catch (_err) {
+    // If chown fails, try chmod as fallback
+    try {
+      execSync(`sudo chmod 666 "${targetPath}"`, { stdio: 'ignore' });
+      return true;
+    } catch (_e) { /* ignore */ }
+  }
+  return false;
+}
+
+/**
+ * Write file with EACCES recovery: if first write fails due to permissions,
+ * attempt to fix ownership and retry once.
+ */
+function safeWriteFileSync(filePath, content, options) {
+  try {
+    fs.writeFileSync(filePath, content, options);
+  } catch (err) {
+    if (err.code === 'EACCES') {
+      log(`🔧 EACCES en ${path.basename(filePath)}, reparando permisos...`);
+      if (fixOwnership(filePath)) {
+        fs.writeFileSync(filePath, content, options);
+        log(`   ✅ Permisos reparados y archivo escrito: ${path.basename(filePath)}`);
+      } else {
+        throw err; // Re-throw if fix didn't work
+      }
+    } else {
+      throw err;
+    }
+  }
+}
 
 // ── .syncignore support ──────────────────────────────────────────────
 const SYNCIGNORE_FILE = path.join(SYNC_DIR, '.syncignore');
@@ -220,6 +270,14 @@ function isIgnoredPath(filePath) {
     return true;
   }
   if (!rel || rel.startsWith('..')) return true;
+
+  // Ignore symlinks — they cause duplicate syncs and permission issues
+  try {
+    const lstat = fs.lstatSync(filePath);
+    if (lstat.isSymbolicLink()) return true;
+  } catch (_err) {
+    // File may not exist yet, that's fine
+  }
 
   const parts = rel.split(path.sep);
   for (const part of parts) {
@@ -782,14 +840,31 @@ class SyncManager {
   ensureDirectoryExists(filePath) {
     const dir = path.dirname(filePath);
     if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+      fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+      // Fix ownership of newly created directories
+      fixOwnership(dir);
       log(`📁 Directorio creado: ${path.relative(SYNC_DIR, dir)}`);
+    } else {
+      // If dir exists but we can't write to it, try to fix
+      try {
+        fs.accessSync(dir, fs.constants.W_OK);
+      } catch (_err) {
+        fixOwnership(dir);
+      }
     }
   }
 
   // Sincronizar un documento de Firestore al archivo local
   async syncDocumentToLocal(docData, localPath) {
     try {
+      // Skip symlinks
+      try {
+        if (fs.lstatSync(localPath).isSymbolicLink()) {
+          log(`⏭️ Omitido symlink: ${path.basename(localPath)}`);
+          return;
+        }
+      } catch (_e) { /* file doesn't exist yet, that's fine */ }
+
       // Asegurar que existe la estructura de directorios (subcarpetas)
       this.ensureDirectoryExists(localPath);
 
@@ -802,14 +877,25 @@ class SyncManager {
       if (docData.content !== undefined) {
         // Verificar si el contenido local es diferente
         if (fs.existsSync(localPath)) {
-          const localContent = fs.readFileSync(localPath, 'utf8');
-          if (localContent === docData.content) {
-            return; // Sin cambios
+          try {
+            const localContent = fs.readFileSync(localPath, 'utf8');
+            if (localContent === docData.content) {
+              return; // Sin cambios
+            }
+          } catch (readErr) {
+            if (readErr.code === 'EACCES') {
+              log(`🔧 EACCES leyendo ${path.basename(localPath)}, reparando...`);
+              fixOwnership(localPath);
+              const localContent = fs.readFileSync(localPath, 'utf8');
+              if (localContent === docData.content) return;
+            } else {
+              throw readErr;
+            }
           }
         }
 
-        // Escribir contenido
-        fs.writeFileSync(localPath, docData.content, 'utf8');
+        // Escribir contenido con manejo de permisos
+        safeWriteFileSync(localPath, docData.content, 'utf8');
         this.recentDownloads.set(localPath, Date.now());
         this.trackLocalFile(localPath);
         log(`📥 Sincronizado desde Firestore: ${docData.name || path.basename(localPath)}`);
@@ -819,7 +905,7 @@ class SyncManager {
         const fileRef = ref(this.storage, docData.storagePath);
         try {
           const buffer = await getBytes(fileRef);
-          fs.writeFileSync(localPath, Buffer.from(buffer));
+          safeWriteFileSync(localPath, Buffer.from(buffer));
           this.recentDownloads.set(localPath, Date.now());
           this.trackLocalFile(localPath);
           log(`Descargado desde Storage: ${docData.name || path.basename(localPath)}`);
@@ -830,7 +916,7 @@ class SyncManager {
         }
       }
     } catch (err) {
-      log(`❌ Error sincronizando documento a local: ${err.message}`);
+      log(`❌ Error sincronizando documento a local (${err.code || ''}): ${err.message}`);
     }
   }
 
@@ -838,7 +924,16 @@ class SyncManager {
   async deleteLocalFile(localPath, fileName) {
     try {
       if (fs.existsSync(localPath)) {
-        fs.unlinkSync(localPath);
+        try {
+          fs.unlinkSync(localPath);
+        } catch (err) {
+          if (err.code === 'EACCES') {
+            fixOwnership(localPath);
+            fs.unlinkSync(localPath);
+          } else {
+            throw err;
+          }
+        }
         this.untrackLocalFile(localPath);
         log(`🗑️ Archivo local eliminado: ${fileName}`);
 
@@ -846,7 +941,7 @@ class SyncManager {
         this.cleanupEmptyParentDirs(path.dirname(localPath));
       }
     } catch (err) {
-      log(`❌ Error eliminando archivo local: ${err.message}`);
+      log(`❌ Error eliminando archivo local (${err.code || ''}): ${err.message}`);
     }
   }
 
@@ -1035,9 +1130,13 @@ class SyncManager {
       if (!localPath) return;
       if (isIgnoredPath(localPath)) return;
 
-      fs.mkdirSync(path.dirname(localPath), { recursive: true });
+      const dir = path.dirname(localPath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+        fixOwnership(dir);
+      }
       const buffer = await getBytes(fileRef);
-      fs.writeFileSync(localPath, Buffer.from(buffer));
+      safeWriteFileSync(localPath, Buffer.from(buffer));
 
       try {
         const metadata = await getMetadata(fileRef);
@@ -1061,12 +1160,34 @@ class SyncManager {
   }
 
   // Recursively scan local directory for files and directories
+  // Skips symlinks to avoid duplicate syncs
   scanLocalFiles(dir, fileList = [], dirList = []) {
     if (!fs.existsSync(dir)) return { files: fileList, dirs: dirList };
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (err) {
+      if (err.code === 'EACCES') {
+        log(`🔧 EACCES escaneando ${path.relative(SYNC_DIR, dir)}, reparando permisos...`);
+        fixOwnership(dir);
+        try {
+          entries = fs.readdirSync(dir, { withFileTypes: true });
+        } catch (_e) {
+          log(`❌ No se pudo leer directorio: ${path.relative(SYNC_DIR, dir)}`);
+          return { files: fileList, dirs: dirList };
+        }
+      } else {
+        return { files: fileList, dirs: dirList };
+      }
+    }
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
       if (isIgnoredPath(fullPath)) continue;
+      // Skip symlinks entirely — they cause duplicate content and permission issues
+      try {
+        const lstat = fs.lstatSync(fullPath);
+        if (lstat.isSymbolicLink()) continue;
+      } catch (_e) { continue; }
       if (entry.isDirectory()) {
         dirList.push(fullPath);
         this.scanLocalFiles(fullPath, fileList, dirList);
@@ -1350,6 +1471,37 @@ async function run() {
     log(`Directorio no existe: ${SYNC_DIR}`);
     return;
   }
+
+  // ── Workspace cleanup at startup ──────────────────────────────────
+  log('🧹 Limpieza inicial del workspace...');
+
+  // Remove .git if present (leftover from old setup)
+  const gitDir = path.join(SYNC_DIR, '.git');
+  if (fs.existsSync(gitDir)) {
+    try {
+      execSync(`sudo rm -rf "${gitDir}"`, { stdio: 'ignore' });
+      log('   🗑️ Eliminado .git residual');
+    } catch (e) {
+      log(`   ⚠️ No se pudo eliminar .git: ${e.message}`);
+    }
+  }
+
+  // Remove broken symlinks and top-level symlinks that shouldn't exist
+  try {
+    execSync(`sudo find "${SYNC_DIR}" -maxdepth 10 -type l ! -exec test -e {} \\; -delete 2>/dev/null`, { stdio: 'ignore' });
+    log('   🗑️ Symlinks rotos limpiados');
+  } catch (_e) { /* ignore */ }
+
+  // Fix ownership of entire workspace (in case entrypoint ran as root)
+  try {
+    execSync(`sudo chown -R ${SYNC_USER}:${SYNC_USER} "${SYNC_DIR}" 2>/dev/null`, { stdio: 'ignore' });
+    log('   ✅ Permisos del workspace verificados');
+  } catch (_e) {
+    log('   ⚠️ No se pudo corregir permisos globales');
+  }
+
+  log('🧹 Limpieza completada');
+  // ── End cleanup ───────────────────────────────────────────────────
 
   const socket = io(NEXUS_URL, {
     auth: {

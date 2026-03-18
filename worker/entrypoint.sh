@@ -204,6 +204,23 @@ check valid [](P -> Q) -> ([]P -> []Q)  // Axioma K
 STGUIDE
     echo "   ✅ .st-guide.md creado"
 fi
+# ── Cleanup & fix permissions ─────────────────────────────────────
+echo "🔧 Fixing workspace permissions and cleaning up..."
+
+# Remove .git directory if it exists (leftover from old setup)
+if [ -d "${WORKSPACE_DIR}/.git" ]; then
+    sudo rm -rf "${WORKSPACE_DIR}/.git"
+    echo "   🗑️ Removed stale .git directory"
+fi
+
+# Remove broken symlinks recursively
+sudo find "${WORKSPACE_DIR}" -maxdepth 10 -type l ! -exec test -e {} \; -delete 2>/dev/null && \
+    echo "   🗑️ Removed broken symlinks" || true
+
+# Fix ownership: ensure everything is owned by estudiante
+# This fixes EACCES errors when sync_agent runs as estudiante
+sudo chown -R estudiante:estudiante "${WORKSPACE_DIR}" 2>/dev/null || true
+echo "   ✅ Permissions fixed (estudiante:estudiante)"
 # ── end setup ─────────────────────────────────────────────────────
 
 # Determine workspace type from token
