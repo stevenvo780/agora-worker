@@ -348,6 +348,7 @@ class SyncManager {
     this.inFlight = new Set();
     this.downloadsInFlight = new Set();
     this.cycleInProgress = false;
+    this.docStoragePaths = new Map(); // docId → storagePath, para detectar moves
     this.firestoreUnsubscribe = null;
     this.rtdbUnsubscribe = null; // Listener de RTDB
     this.knownLocalFiles = new Set(); // Archivos que sabemos que existen localmente
@@ -812,7 +813,14 @@ class SyncManager {
         // Ignorar el snapshot inicial - el syncCycle se encargará de la sincronización inicial
         if (isInitialSnapshot) {
           isInitialSnapshot = false;
-          log(`📋 Snapshot inicial ignorado (${snapshot.size} documentos)`);
+          // Cachear storagePaths del snapshot inicial para detectar moves después
+          for (const docSnap of snapshot.docs) {
+            const d = docSnap.data();
+            if (d.storagePath) {
+              this.docStoragePaths.set(docSnap.id, d.storagePath);
+            }
+          }
+          log(`📋 Snapshot inicial: ${snapshot.size} documentos (paths cacheados)`);
           return;
         }
 
@@ -835,10 +843,29 @@ class SyncManager {
             if (change.type === 'added' || change.type === 'modified') {
               // Descargar/actualizar archivo desde Firebase
               log(`📨 Firestore: ${change.type} ${data.name || docSnap.id}`);
+
+              // Detectar cambio de storagePath (rename/move desde la plataforma)
+              const prevStoragePath = this.docStoragePaths.get(docSnap.id);
+              if (prevStoragePath && prevStoragePath !== data.storagePath) {
+                const oldLocalPath = this.getLocalPath(prevStoragePath);
+                if (oldLocalPath && oldLocalPath !== localPath && fs.existsSync(oldLocalPath)) {
+                  log(`🔄 StoragePath cambió: ${path.basename(oldLocalPath)} → ${path.basename(localPath)}, limpiando archivo viejo`);
+                  try {
+                    fs.unlinkSync(oldLocalPath);
+                    this.untrackLocalFile(oldLocalPath);
+                    this.recentDownloads.set(oldLocalPath, Date.now()); // Evitar re-upload del viejo
+                  } catch (e) {
+                    log(`⚠️ Error eliminando archivo viejo: ${e.message}`);
+                  }
+                }
+              }
+              this.docStoragePaths.set(docSnap.id, data.storagePath);
+
               await this.syncDocumentToLocal(data, localPath);
             } else if (change.type === 'removed') {
               // Borrar archivo local cuando se borra de Firebase
               log(`📨 Firestore: removed ${data.name || docSnap.id}`);
+              this.docStoragePaths.delete(docSnap.id);
               await this.deleteLocalFile(localPath, data.name || docSnap.id);
             }
           }
@@ -1046,6 +1073,7 @@ class SyncManager {
       if (snapshot.empty) {
         // Crear nuevo documento en Firestore si no existe
         const fileName = path.basename(localPath);
+        const fileExt = getExtLower(localPath);
 
         // Calcular el folder basado en la estructura de directorios
         const relPath = path.relative(SYNC_DIR, localPath);
@@ -1053,9 +1081,16 @@ class SyncManager {
         // Si está en la raíz, usar "No estructurado", sino usar el path de directorio
         const folder = (dirPath === '.' || dirPath === '') ? 'No estructurado' : dirPath.split(path.sep).join('/');
 
+        // Para .md: quitar extensión (convención de la plataforma).
+        // Para .st y otros: conservar la extensión completa.
+        const isMarkdown = fileExt === '.md' || fileExt === '.markdown';
+        const docName = isMarkdown ? fileName.replace(/\.(md|markdown)$/i, '') : fileName;
+
         const docData = {
-          name: fileName.replace(/\.[^/.]+$/, ''), // nombre sin extensión
+          name: docName,
           content,
+          type: 'text',
+          mimeType: getContentTypeForExt(fileExt),
           storagePath: remotePath,
           workspaceId: tokenInfo.firestoreWorkspaceId,
           ownerId: tokenInfo.userId || tokenInfo.firestoreWorkspaceId,
