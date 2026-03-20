@@ -83,7 +83,7 @@ RUN npm install -g \
     nodemon \
     live-server \
     http-server \
-    @stevenvo780/st-lang@2.0.0
+    @stevenvo780/st-lang@2.6.1
 
 # Create symlinks for better command names
 RUN ln -sf /usr/bin/fdfind /usr/bin/fd && \
@@ -109,6 +109,10 @@ RUN echo '' >> /home/estudiante/.bashrc && \
 RUN git config --system color.ui auto && \
     git config --system init.defaultBranch main && \
     git config --system core.autocrlf input
+
+# Backup skeleton home files so entrypoint can restore them when /home/estudiante
+# is mounted as an empty persistent volume (preserving .codex, .claude, etc.)
+RUN cp -a /home/estudiante /etc/skel-estudiante
 
 # Create /workspace with proper permissions
 RUN mkdir -p /workspace && chown estudiante:estudiante /workspace

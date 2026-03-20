@@ -11,6 +11,22 @@ echo "🔌 Worker Configuration:"
 echo "   Hub URL: ${NEXUS_URL:-http://localhost:3010}"
 echo "   Token: ${WORKER_TOKEN:-<not set>}"
 
+# ── Restore skeleton home files when /home/estudiante is a persistent volume ──
+# When the host mounts an empty directory over /home/estudiante, the Dockerfile's
+# dotfiles (.bashrc, .profile, .bash_logout) are hidden. This restores them.
+SKEL_DIR="/etc/skel-estudiante"
+HOME_DIR="/home/estudiante"
+if [ -d "$SKEL_DIR" ]; then
+    for f in .bashrc .profile .bash_logout; do
+        if [ ! -f "${HOME_DIR}/${f}" ] && [ -f "${SKEL_DIR}/${f}" ]; then
+            cp "${SKEL_DIR}/${f}" "${HOME_DIR}/${f}"
+            echo "   📋 Restored ${f} from skeleton"
+        fi
+    done
+    # Also restore sudo_as_admin marker
+    touch "${HOME_DIR}/.sudo_as_admin_successful" 2>/dev/null || true
+fi
+
 # ── Create default .syncignore and repos/ if missing ──────────────
 WORKSPACE_DIR="/workspace"
 SYNCIGNORE_FILE="${WORKSPACE_DIR}/.syncignore"
@@ -199,7 +215,7 @@ check valid [](P -> Q) -> ([]P -> []Q)  // Axioma K
 ```
 
 ---
-*ST v1.0.0 — Motor de lógica formal multi-sistema*
+*ST v2.6.1 — Motor de lógica formal multi-sistema*
 *Docs completas: https://github.com/stevenvo780/ST*
 STGUIDE
     echo "   ✅ .st-guide.md creado"
