@@ -58,10 +58,9 @@ target
 *.class
 *.jar
 
-# Paquetes pesados (ya están en IGNORE_LIST por defecto)
-# node_modules
-# .git
-# .next
+# Carpetas de dependencias y build (pesadas, no sincronizar)
+node_modules
+.next
 SYNCIGNORE
     echo "   ✅ .syncignore creado con valores por defecto"
 fi
@@ -223,11 +222,8 @@ fi
 # ── Cleanup & fix permissions ─────────────────────────────────────
 echo "🔧 Fixing workspace permissions and cleaning up..."
 
-# Remove .git directory if it exists (leftover from old setup)
-if [ -d "${WORKSPACE_DIR}/.git" ]; then
-    sudo rm -rf "${WORKSPACE_DIR}/.git"
-    echo "   🗑️ Removed stale .git directory"
-fi
+# Note: .git directories are preserved locally (not synced, not deleted).
+# Users manage their own repos freely.
 
 # Remove broken symlinks recursively
 sudo find "${WORKSPACE_DIR}" -maxdepth 10 -type l ! -exec test -e {} \; -delete 2>/dev/null && \
@@ -238,6 +234,25 @@ sudo find "${WORKSPACE_DIR}" -maxdepth 10 -type l ! -exec test -e {} \; -delete 
 sudo chown -R estudiante:estudiante "${WORKSPACE_DIR}" 2>/dev/null || true
 echo "   ✅ Permissions fixed (estudiante:estudiante)"
 # ── end setup ─────────────────────────────────────────────────────
+
+# ── Auto-install user packages ────────────────────────────────────
+# Users can create ~/.user-packages with one npm package per line.
+# These are re-installed on every container start to survive image updates.
+USER_PACKAGES_FILE="/home/estudiante/.user-packages"
+if [ -f "$USER_PACKAGES_FILE" ]; then
+    echo "📦 Installing user packages from .user-packages..."
+    while IFS= read -r pkg || [[ -n "$pkg" ]]; do
+        pkg=$(echo "$pkg" | xargs)  # trim whitespace
+        [[ -z "$pkg" || "$pkg" == \#* ]] && continue
+        if ! command -v "$(echo "$pkg" | sed 's/@.*//' | xargs basename)" &>/dev/null; then
+            echo "   📥 Installing: $pkg"
+            sudo npm install -g "$pkg" --loglevel=error 2>&1 | tail -1 || \
+                echo "   ⚠️  Failed to install: $pkg"
+        fi
+    done < "$USER_PACKAGES_FILE"
+    echo "   ✅ User packages processed"
+fi
+# ── end user packages ─────────────────────────────────────────────
 
 # Determine workspace type from token
 if [[ "$WORKER_TOKEN" == personal:* ]]; then

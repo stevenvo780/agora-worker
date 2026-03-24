@@ -97,7 +97,9 @@ if (!WORKER_TOKEN) {
   process.exit(1);
 }
 
-const IGNORE_LIST = new Set(['.git', '.DS_Store', 'node_modules', '.next', 'repos', '.st-guide.md']);
+// Only OS-level artifacts that should NEVER be synced regardless of user config.
+// All other patterns belong in the per-project .syncignore file.
+const IGNORE_LIST = new Set(['.DS_Store', 'Thumbs.db', 'desktop.ini']);
 
 // ── Ownership repair ─────────────────────────────────────────────────
 const SYNC_USER = process.env.SYNC_USER || 'estudiante';
@@ -153,8 +155,41 @@ const SYNCIGNORE_FILE = path.join(SYNC_DIR, '.syncignore');
 let syncIgnorePatterns = new Set(); // dynamic set loaded from .syncignore
 let syncIgnoreRegexes = []; // pre-compiled regex cache for wildcard patterns
 
+const DEFAULT_SYNCIGNORE = `# .syncignore — Patrones de archivos/carpetas que NO se sincronizan.
+# Cada línea es un nombre o un patrón glob simple (e.g. *.pyc).
+# Líneas vacías y comentarios (#) se ignoran.
+# Este archivo es local: cada usuario controla su almacenamiento.
+
+# Carpetas de dependencias y build
+node_modules
+.next
+__pycache__
+*.pyc
+
+# Repositorios (pesados, no necesitan sync)
+repos
+
+# Archivos de guía del sistema
+.st-guide.md
+`;
+
+/**
+ * Create a default .syncignore if none exists, so every user starts
+ * with sane defaults they can customise.
+ */
+function ensureDefaultSyncIgnore() {
+  try {
+    if (fs.existsSync(SYNCIGNORE_FILE)) return;
+    safeWriteFileSync(SYNCIGNORE_FILE, DEFAULT_SYNCIGNORE, 'utf-8');
+    log('📋 .syncignore creado con patrones por defecto');
+  } catch (err) {
+    log(`⚠️  No se pudo crear .syncignore por defecto: ${err.message}`);
+  }
+}
+
 function loadSyncIgnore() {
   try {
+    ensureDefaultSyncIgnore();
     if (!fs.existsSync(SYNCIGNORE_FILE)) return;
     const raw = fs.readFileSync(SYNCIGNORE_FILE, 'utf-8');
     const newPatterns = new Set();
@@ -1568,16 +1603,8 @@ async function run() {
   // ── Workspace cleanup at startup ──────────────────────────────────
   log('🧹 Limpieza inicial del workspace...');
 
-  // Remove .git if present (leftover from old setup)
-  const gitDir = path.join(SYNC_DIR, '.git');
-  if (fs.existsSync(gitDir)) {
-    try {
-      execSync(`sudo rm -rf "${gitDir}"`, { stdio: 'ignore' });
-      log('   🗑️ Eliminado .git residual');
-    } catch (e) {
-      log(`   ⚠️ No se pudo eliminar .git: ${e.message}`);
-    }
-  }
+  // Note: .git directories are preserved locally (not synced, not deleted).
+  // Users manage their own repos via .syncignore.
 
   // Remove broken symlinks and top-level symlinks that shouldn't exist
   try {
