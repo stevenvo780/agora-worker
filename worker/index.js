@@ -80,12 +80,17 @@ function generateSignedToken(id, secret) {
   return `${payloadB64}.${signature}`;
 }
 
-const signedToken = generateSignedToken(WORKER_ID, WORKER_SECRET);
+// Note: DO NOT generate signedToken here — it expires after 5 minutes.
+// Use socket.io's auth function to regenerate on each (re)connection.
 
 const socket = io(NEXUS_URL, {
-  auth: {
-    type: 'worker',
-    workerToken: signedToken
+  auth: (cb) => {
+    // Fresh token per connection attempt (timestamp must be within 5 min)
+    const freshToken = generateSignedToken(WORKER_ID, WORKER_SECRET);
+    cb({
+      type: 'worker',
+      workerToken: freshToken
+    });
   },
   transports: ['websocket'],
   reconnection: true,

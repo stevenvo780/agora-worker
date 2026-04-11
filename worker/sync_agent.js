@@ -4,11 +4,11 @@ import crypto from 'crypto';
 import { execSync } from 'child_process';
 import chokidar from 'chokidar';
 import { initializeApp } from 'firebase/app';
-import { getAuth, signInWithCustomToken } from 'firebase/auth';
+import { getAuth, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
 import {
   getFirestore, collection, query, where, onSnapshot,
   getDocs, addDoc, updateDoc, deleteDoc,
-  serverTimestamp
+  serverTimestamp, increment
 } from 'firebase/firestore';
 import {
   getStorage, ref, uploadBytes,
@@ -37,8 +37,10 @@ const SYNC_DIR = '/workspace';
 const WORKER_SECRET = process.env.WORKER_SECRET || '';
 const POLL_INTERVAL_MS = (() => {
   const raw = process.env.SYNC_POLL_MS;
-  const parsed = raw ? Number(raw) : 30000;
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 30000;
+  // Default 120s — real-time sync is handled by Firestore/RTDB listeners.
+  // SyncCycle is now only a reconciliation safety net (Arreglo 3).
+  const parsed = raw ? Number(raw) : 120000;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 120000;
 })();
 const CLOCK_SKEW_MS = 2000;
 const RTDB_CLOCK_SKEW_MS = 2 * 60 * 1000;
@@ -280,7 +282,9 @@ function log(message) {
   console.log(`${ts} - ${message}`);
 }
 
-const signedToken = generateSignedToken(WORKER_TOKEN, WORKER_SECRET);
+// Note: DO NOT generate signedToken here as a const — it contains a timestamp
+// and expires after 5 minutes. It must be regenerated on each (re)connection.
+// See the socket.io auth function below.
 
 // Inicialización de Firebase Client SDK
 const app = initializeApp(FIREBASE_CONFIG);
@@ -397,6 +401,10 @@ class SyncManager {
     this.renameBatchTimer = null;
     this.pendingFolderRenames = new Map(); // oldDir -> newDir
 
+    // ── Version tracking (Arreglo 2) ──
+    // Track last known updatedAt per docId to avoid processing our own echoed writes
+    this.docVersions = new Map(); // docId → last known updatedAt timestamp (ms)
+
     this.mounts.push({
       local: SYNC_DIR,
       remote: tokenInfo.storagePath
@@ -432,8 +440,10 @@ class SyncManager {
   // Limpiar cambios locales antiguos
   cleanupLocalChanges() {
     const now = Date.now();
+    // Use DOWNLOAD_GRACE_MS + margin to cover full sync cycle duration
+    const LOCAL_CHANGE_GRACE_MS = DOWNLOAD_GRACE_MS + 5000; // 20s total
     for (const [filePath, ts] of this.recentLocalChanges.entries()) {
-      if (now - ts > 5000) { // 5 segundos de gracia
+      if (now - ts > LOCAL_CHANGE_GRACE_MS) {
         this.recentLocalChanges.delete(filePath);
       }
     }
@@ -869,6 +879,19 @@ class SyncManager {
             const localPath = this.getLocalPath(data.storagePath);
             if (!localPath) continue;
 
+            // ── Version-based dedup (Arreglo 2) ──
+            // Skip if this is an echo of our own write
+            if (change.type === 'modified' && data.updatedAt) {
+              const updatedMs = typeof data.updatedAt.toMillis === 'function'
+                ? data.updatedAt.toMillis()
+                : (typeof data.updatedAt === 'number' ? data.updatedAt : 0);
+              const lastKnown = this.docVersions.get(docSnap.id);
+              if (lastKnown && lastKnown === updatedMs) {
+                continue; // Same version, skip
+              }
+              this.docVersions.set(docSnap.id, updatedMs);
+            }
+
             // Evitar procesar cambios que nosotros mismos causamos
             if (this.isRecentLocalChange(localPath)) {
               log(`⏭️ Ignorando cambio propio: ${data.name || docSnap.id}`);
@@ -901,6 +924,7 @@ class SyncManager {
               // Borrar archivo local cuando se borra de Firebase
               log(`📨 Firestore: removed ${data.name || docSnap.id}`);
               this.docStoragePaths.delete(docSnap.id);
+              this.docVersions.delete(docSnap.id);
               await this.deleteLocalFile(localPath, data.name || docSnap.id);
             }
           }
@@ -1135,15 +1159,20 @@ class SyncManager {
         };
         const newDoc = await addDoc(collection(this.db, 'documents'), docData);
         log(`Firestore documento creado: ${newDoc.id} (${fileName}) en carpeta: ${folder}`);
+        // For creates, publish full event (Firestore listener may not catch it fast enough)
         this.notifyFileChange('created', fileName, newDoc.id);
       } else {
+        // Pre-stamp version so our Firestore listener skips the echo (Arreglo 2)
+        const preStampTs = Date.now();
         for (const docSnap of snapshot.docs) {
+          this.docVersions.set(docSnap.id, preStampTs);
           await updateDoc(docSnap.ref, {
             content,
             updatedAt: serverTimestamp()
           });
           log(`Firestore actualizado: ${docSnap.id}`);
-          this.notifyFileChange('updated', path.basename(localPath), docSnap.id);
+          // For updates, use socket only — Firestore listener already handles propagation (Arreglo 3)
+          this.notifyViaSocket('updated', path.basename(localPath), docSnap.id);
         }
       }
     } catch (err) {
@@ -1174,27 +1203,42 @@ class SyncManager {
 
     this.inFlight.add(localPath);
     try {
-      const fileRef = ref(this.storage, remotePath);
-      let metadata = null;
-      try {
-        metadata = await getMetadata(fileRef);
-      } catch (err) {
-        if (err.code !== 'storage/object-not-found') throw err;
-      }
+      // ── Arreglo 1: Firestore content as source of truth ──
+      // For text files, compare against Firestore content first (cheaper, avoids Storage race)
+      const localContent = await fs.promises.readFile(localPath, 'utf8');
 
-      if (metadata && metadata.md5Hash) {
-        const localMd5 = await md5Base64(localPath);
-        if (metadata.md5Hash === localMd5) {
+      // Check if Firestore already has this exact content
+      const q = query(
+        collection(this.db, 'documents'),
+        where('storagePath', '==', remotePath)
+      );
+      const firestoreSnap = await getDocs(q);
+      if (!firestoreSnap.empty) {
+        const existingContent = firestoreSnap.docs[0].data().content;
+        if (existingContent === localContent) {
+          // Content is identical — skip entire upload
+          this.trackLocalFile(localPath);
           return;
         }
       }
 
-      const content = await fs.promises.readFile(localPath);
-      const contentType = getContentTypeForExt(ext);
-      await uploadBytes(fileRef, content, { contentType });
-      log(`Subido: ${path.basename(localPath)} (${contentType})`);
+      // Content differs — update Firestore first (immediate visibility to frontend)
       this.trackLocalFile(localPath);
       await this.updateFirestore(remotePath, localPath);
+
+      // Then upload to Storage as backup (non-blocking for sync flow)
+      const content = await fs.promises.readFile(localPath);
+      const contentType = getContentTypeForExt(ext);
+      const fileRef = ref(this.storage, remotePath);
+      uploadBytes(fileRef, content, { contentType })
+        .then(() => log(`📤 Storage backup: ${path.basename(localPath)}`))
+        .catch((err) => {
+          if (err && (err.code === 'storage/unauthorized' || err.code === 'storage/unauthenticated')) {
+            blockUpload(localPath, 'reglas de Storage');
+          } else {
+            log(`⚠️ Error subiendo a Storage (no-blocking): ${err.message}`);
+          }
+        });
     } catch (err) {
       if (err && (err.code === 'storage/unauthorized' || err.code === 'storage/unauthenticated')) {
         log(`⛔ Upload bloqueado: ${path.basename(localPath)} - ${err.code} - ${err.message}`);
@@ -1548,9 +1592,10 @@ class SyncManager {
         }
       }
 
-      // Limpiar recentLocalChanges vencidos
+      // Limpiar recentLocalChanges vencidos (must match cleanupLocalChanges threshold)
+      const LOCAL_CHANGE_GRACE_MS_CLEANUP = DOWNLOAD_GRACE_MS + 5000;
       for (const [filePath, ts] of this.recentLocalChanges.entries()) {
-        if (now - ts > 5000) {
+        if (now - ts > LOCAL_CHANGE_GRACE_MS_CLEANUP) {
           this.recentLocalChanges.delete(filePath);
         }
       }
@@ -1624,9 +1669,15 @@ async function run() {
   // ── End cleanup ───────────────────────────────────────────────────
 
   const socket = io(NEXUS_URL, {
-    auth: {
-      type: 'sync-agent',
-      workerToken: signedToken
+    auth: (cb) => {
+      // Generate a fresh signed token for EVERY connection/reconnection attempt.
+      // The token includes timestamp: Date.now() and the Hub rejects tokens
+      // older than 5 minutes (WORKER_TOKEN_MAX_AGE_MS).
+      const freshToken = generateSignedToken(WORKER_TOKEN, WORKER_SECRET);
+      cb({
+        type: 'sync-agent',
+        workerToken: freshToken
+      });
     },
     transports: ['websocket'],
     reconnection: true,
@@ -1644,10 +1695,28 @@ async function run() {
     log(`⚠️ Error conectando al Hub: ${err.message}`);
   });
 
+  let syncInitialized = false; // Track whether sync infrastructure is set up
+
   socket.on('firebase-custom-token', async ({ token }) => {
     try {
       await signInWithCustomToken(auth, token);
       log(`🔐 Autenticado con Firebase Custom Token`);
+
+      // If already initialized, this is a re-auth — don't re-create infrastructure
+      if (syncInitialized) {
+        log('🔑 Re-autenticación completada (infraestructura ya activa)');
+        return;
+      }
+      syncInitialized = true;
+
+      // ── Arreglo 5: Re-autenticación automática ──
+      // Monitor auth state — request new token if it becomes null (expired)
+      onAuthStateChanged(auth, (user) => {
+        if (!user) {
+          log('🔑 Auth state lost (token expired?), requesting new token...');
+          socket.emit('request-firebase-token');
+        }
+      });
 
       const manager = new SyncManager(storage, db, socket, rtdb);
       await manager.loadWorkspaceMounts();
@@ -1663,7 +1732,7 @@ async function run() {
         ignoreInitial: true,
         ignored: (filePath) => isIgnoredPath(filePath),
         usePolling: false,
-        awaitWriteFinish: { stabilityThreshold: 1000, pollInterval: 200 }
+        awaitWriteFinish: { stabilityThreshold: 2000, pollInterval: 300 }
       });
 
       // ── Rename-aware file handlers ──

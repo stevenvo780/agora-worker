@@ -214,7 +214,7 @@ check valid [](P -> Q) -> ([]P -> []Q)  // Axioma K
 ```
 
 ---
-*ST v2.6.1 — Motor de lógica formal multi-sistema*
+*ST v$(st --version 2>/dev/null || echo "unknown") — Motor de lógica formal multi-sistema*
 *Docs completas: https://github.com/stevenvo780/ST*
 STGUIDE
     echo "   ✅ .st-guide.md creado"
