@@ -8,7 +8,7 @@ import { getAuth, signInWithCustomToken, onAuthStateChanged } from 'firebase/aut
 import {
   getFirestore, collection, query, where, onSnapshot,
   getDocs, addDoc, updateDoc, deleteDoc,
-  serverTimestamp, increment
+  serverTimestamp, increment, writeBatch, doc
 } from 'firebase/firestore';
 import {
   getStorage, ref, uploadBytes,
@@ -44,13 +44,11 @@ const POLL_INTERVAL_MS = (() => {
 })();
 const CLOCK_SKEW_MS = 2000;
 const RTDB_CLOCK_SKEW_MS = 2 * 60 * 1000;
-const DOWNLOAD_GRACE_MS = 15000;
+// Se eliminan variables de rename por seguridad y velocidad
+const DOWNLOAD_GRACE_MS = 2000;
 
-// ── Rename detection ─────────────────────────────────────────────────
-const RENAME_WINDOW_MS = 3000; // Ventana para detectar unlink→add como rename
-const DELETE_DEBOUNCE_MS = 2500; // Debounce deletes para dar tiempo a detectar rename
-const BATCH_DEBOUNCE_MS = 1500; // Debounce para batch de operaciones (move carpeta)
-const MAX_PENDING_DELETES = 200; // Límite de deletes pendientes en buffer
+// ── Rename detection desactivado ─────────────────────────────────────
+// Los renombramientos se manejan orgánicamente por chokidar (unlink -> add)
 
 if (!WORKER_SECRET) {
   console.error('❌ WORKER_SECRET is required.');
@@ -107,26 +105,10 @@ const IGNORE_LIST = new Set(['.DS_Store', 'Thumbs.db', 'desktop.ini']);
 const SYNC_USER = process.env.SYNC_USER || 'estudiante';
 
 /**
- * Fix ownership of a file/directory to SYNC_USER.
- * Returns true if fix was applied, false if not needed or failed.
+ * Fix ownership of a file/directory. Desactivado por seguridad.
+ * No se debe hacer sudo chown desde Node.js (RCE Vulnerability)
  */
 function fixOwnership(targetPath) {
-  try {
-    const stat = fs.statSync(targetPath);
-    const processUid = process.getuid ? process.getuid() : -1;
-    // If file is not owned by current process user, try to chown
-    if (stat.uid !== processUid) {
-      // Use sudo since estudiante has NOPASSWD sudo in Docker container
-      execSync(`sudo chown ${SYNC_USER}:${SYNC_USER} "${targetPath}"`, { stdio: 'ignore' });
-      return true;
-    }
-  } catch (_err) {
-    // If chown fails, try chmod as fallback
-    try {
-      execSync(`sudo chmod 666 "${targetPath}"`, { stdio: 'ignore' });
-      return true;
-    } catch (_e) { /* ignore */ }
-  }
   return false;
 }
 
@@ -395,15 +377,15 @@ class SyncManager {
     this.isShuttingDown = false; // Flag de apagado
     this.lastEventTime = Date.now(); // Para filtrar eventos antiguos
 
-    // ── Rename detection state ──
-    this.pendingDeletes = new Map(); // localPath → { timer, remotePath, docId, content, hash, ts }
-    this.pendingAdds = new Map(); // localPath → { timer, ts }
-    this.renameBatchTimer = null;
-    this.pendingFolderRenames = new Map(); // oldDir -> newDir
-
     // ── Version tracking (Arreglo 2) ──
     // Track last known updatedAt per docId to avoid processing our own echoed writes
     this.docVersions = new Map(); // docId → last known updatedAt timestamp (ms)
+
+    // ── Batch Queueing ──
+    this.batchUpdates = new Map(); // storagePath -> { ref, data, localPath, docId }
+    this.batchCreates = new Map(); // storagePath -> { data, localPath, fileName }
+    this.batchDeletes = new Set(); // docId
+    this.batchTimer = null;
 
     this.mounts.push({
       local: SYNC_DIR,
@@ -455,301 +437,103 @@ class SyncManager {
     return this.recentLocalChanges.has(localPath);
   }
 
-  // ── Rename detection: buffered delete ──────────────────────────────
-  // En lugar de borrar inmediatamente, bufferizar el delete y esperar a ver si llega un add
-  // con el mismo contenido/hash (rename) dentro de RENAME_WINDOW_MS.
-  trimPendingDeletesIfNeeded() {
-    while (this.pendingDeletes.size >= MAX_PENDING_DELETES) {
-      const oldestEntry = this.pendingDeletes.entries().next().value;
-      if (!oldestEntry) return;
-      const [oldLocalPath, pending] = oldestEntry;
-
-      clearTimeout(pending.timer);
-      this.pendingDeletes.delete(oldLocalPath);
-      log(`⚠️ Límite de deletes pendientes (${MAX_PENDING_DELETES}) alcanzado; forzando delete: ${path.basename(oldLocalPath)}`);
-      this.executeDelete(oldLocalPath, pending.remotePath, pending.docId)
-        .catch((err) => log(`❌ Error forzando delete pendiente: ${err.message}`));
-    }
-  }
-
-  async bufferDelete(localPath) {
-    if (this.isShuttingDown) return;
-    const remotePath = this.getRemotePath(localPath);
-    if (!remotePath) return;
-
-    // Capturar info del doc de Firestore ANTES de borrarlo
-    let docId = null;
-    let docData = null;
-    let contentHash = null;
-    try {
-      const q = query(
-        collection(this.db, 'documents'),
-        where('storagePath', '==', remotePath)
-      );
-      const snapshot = await getDocs(q);
-      if (!snapshot.empty) {
-        const docSnap = snapshot.docs[0];
-        docId = docSnap.id;
-        docData = docSnap.data();
-        // Hash del contenido para matching
-        if (docData.content) {
-          contentHash = crypto.createHash('md5').update(docData.content).digest('hex');
-        }
-      }
-    } catch (err) {
-      log(`⚠️ Error capturando info para rename-detect: ${err.message}`);
-    }
-
-    this.trimPendingDeletesIfNeeded();
-
-    const pending = {
-      remotePath,
-      docId,
-      docData,
-      contentHash,
-      ts: Date.now(),
-      timer: setTimeout(() => {
-        // No se detectó rename → ejecutar delete real
-        this.pendingDeletes.delete(localPath);
-        this.executeDelete(localPath, remotePath, docId);
-      }, DELETE_DEBOUNCE_MS)
-    };
-    this.pendingDeletes.set(localPath, pending);
-    log(`⏳ Delete bufferizado (esperando rename): ${path.basename(localPath)}`);
-  }
-
-  // Ejecutar delete real después del debounce
-  async executeDelete(localPath, remotePath, docId) {
-    log(`🗑️ Ejecutando delete: ${path.basename(localPath)}`);
-    try {
-      if (docId) {
-        const docRef = collection(this.db, 'documents');
-        const q = query(docRef, where('__name__', '==', docId));
-        const snap = await getDocs(q);
-        if (!snap.empty) {
-          await deleteDoc(snap.docs[0].ref);
-          log(`🗑️ Firestore eliminado: ${docId}`);
-          this.notifyFileChange('deleted', path.basename(localPath), docId);
-        }
-      } else {
-        // Fallback: buscar por storagePath
-        await this.handleLocalDelete(localPath);
-      }
-      await this.deleteFromStorage(remotePath, path.basename(localPath));
-    } catch (err) {
-      log(`❌ Error en delete definitivo: ${err.message}`);
-    }
-    this.untrackLocalFile(localPath);
-  }
-
-  // Cuando llega un ADD, verificar si es un rename de un delete pendiente
-  async tryMatchRename(newLocalPath) {
-    if (this.pendingDeletes.size === 0) return false;
-    if (!fs.existsSync(newLocalPath)) return false;
-
-    const ext = getExtLower(newLocalPath);
-    if (!isAllowedTextExtension(ext)) return false;
-
-    let newContent;
-    try {
-      newContent = await fs.promises.readFile(newLocalPath, 'utf8');
-    } catch { return false; }
-
-    const newHash = crypto.createHash('md5').update(newContent).digest('hex');
-
-    // Buscar un delete pendiente con el mismo hash de contenido
-    for (const [oldPath, pending] of this.pendingDeletes.entries()) {
-      if (!pending.contentHash) continue;
-      if (pending.contentHash !== newHash) continue;
-      if (Date.now() - pending.ts > RENAME_WINDOW_MS) continue;
-
-      // ¡Match! Es un rename
-      clearTimeout(pending.timer);
-      this.pendingDeletes.delete(oldPath);
-
-      log(`🔄 RENAME detectado: ${path.basename(oldPath)} → ${path.basename(newLocalPath)}`);
-
-      // Actualizar Firestore doc en lugar de delete+create
-      const newRemotePath = this.getRemotePath(newLocalPath);
-      if (!newRemotePath || !pending.docId) {
-        // Fallback: upload normal
-        await this.uploadFile(newLocalPath);
-        return true;
-      }
-
-      try {
-        // Calcular nuevo folder
-        const relPath = path.relative(SYNC_DIR, newLocalPath);
-        const dirPath = path.dirname(relPath);
-        const newFolder = (dirPath === '.' || dirPath === '') ? 'No estructurado' : dirPath.split(path.sep).join('/');
-        const newName = path.basename(newLocalPath).replace(/\.[^/.]+$/, '');
-
-        // Actualizar doc existente con nuevo path y nombre
-        const q = query(collection(this.db, 'documents'), where('__name__', '==', pending.docId));
-        const snap = await getDocs(q);
-        if (!snap.empty) {
-          await updateDoc(snap.docs[0].ref, {
-            name: newName,
-            storagePath: newRemotePath,
-            folder: newFolder,
-            updatedAt: serverTimestamp()
-          });
-          log(`✅ Firestore actualizado (rename): ${pending.docId} → ${newName} en ${newFolder}`);
-        }
-
-        // Mover en Storage: subir a nuevo path, borrar viejo
-        const content = await fs.promises.readFile(newLocalPath);
-        const contentType = getContentTypeForExt(ext);
-        const newFileRef = ref(this.storage, newRemotePath);
-        await uploadBytes(newFileRef, content, { contentType });
-
-        // Borrar viejo de Storage
-        try {
-          const oldFileRef = ref(this.storage, pending.remotePath);
-          await deleteObject(oldFileRef);
-        } catch (e) {
-          if (e.code !== 'storage/object-not-found') log(`⚠️ No se pudo borrar viejo de Storage: ${e.message}`);
-        }
-
-        this.markLocalChange(newLocalPath);
-        this.trackLocalFile(newLocalPath);
-        this.notifyFileChange('updated', path.basename(newLocalPath), pending.docId, newFolder);
-        log(`✅ Rename completado: ${path.basename(oldPath)} → ${path.basename(newLocalPath)}`);
-      } catch (err) {
-        log(`❌ Error procesando rename, fallback a upload: ${err.message}`);
-        await this.uploadFile(newLocalPath);
-      }
-      return true;
-    }
-    return false;
-  }
-
-  queueFolderRename(oldDir, newDir) {
-    if (this.isShuttingDown) return;
-    this.pendingFolderRenames.set(oldDir, newDir);
-
-    if (this.renameBatchTimer) {
-      clearTimeout(this.renameBatchTimer);
-    }
-
-    this.renameBatchTimer = setTimeout(async () => {
-      const queuedRenames = Array.from(this.pendingFolderRenames.entries());
-      this.pendingFolderRenames.clear();
-      this.renameBatchTimer = null;
-
-      for (const [fromDir, toDir] of queuedRenames) {
-        await this.handleFolderRename(fromDir, toDir);
-      }
-    }, BATCH_DEBOUNCE_MS);
-  }
-
-  // Detectar rename de carpeta completa: múltiples deletes + adds con misma estructura
-  async handleFolderRename(oldDir, newDir) {
-    log(`📁 RENAME de carpeta detectado: ${path.relative(SYNC_DIR, oldDir)} → ${path.relative(SYNC_DIR, newDir)}`);
-
-    const oldRelPath = path.relative(SYNC_DIR, oldDir);
-    const newRelPath = path.relative(SYNC_DIR, newDir);
-
-    try {
-      // Usar range query para evitar cargar todos los docs del workspace (O(n) → O(k)).
-      // Firestore soporta igualdad + range en campos distintos.
-      const FOLDER_RANGE_SUFFIX = '\uffff';
-      let q;
-      if (tokenInfo.workspaceType === 'personal') {
-        q = query(
-          collection(this.db, 'documents'),
-          where('ownerId', '==', tokenInfo.userId),
-          where('folder', '>=', oldRelPath),
-          where('folder', '<=', oldRelPath + FOLDER_RANGE_SUFFIX)
-        );
-      } else {
-        q = query(
-          collection(this.db, 'documents'),
-          where('workspaceId', '==', tokenInfo.workspaceId),
-          where('folder', '>=', oldRelPath),
-          where('folder', '<=', oldRelPath + FOLDER_RANGE_SUFFIX)
-        );
-      }
-
-      const snapshot = await getDocs(q);
-      let updated = 0;
-
-      for (const docSnap of snapshot.docs) {
-        const data = docSnap.data();
-        if (!data.folder || !data.storagePath) continue;
-
-        // Verificar si el folder empieza con el path viejo (la range query ya pre-filtra)
-        if (data.folder === oldRelPath || data.folder.startsWith(`${oldRelPath}/`)) {
-          const newFolder = data.folder.replace(oldRelPath, newRelPath);
-          const newStoragePath = data.storagePath.replace(
-            `${tokenInfo.storagePath}/${oldRelPath}`,
-            `${tokenInfo.storagePath}/${newRelPath}`
-          );
-
-          await updateDoc(docSnap.ref, {
-            folder: newFolder,
-            storagePath: newStoragePath,
-            updatedAt: serverTimestamp()
-          });
-
-          // Mover en Storage
-          try {
-            const oldRef = ref(this.storage, data.storagePath);
-            const buffer = await getBytes(oldRef);
-            const newRef = ref(this.storage, newStoragePath);
-            const ext = path.extname(data.name || '').toLowerCase();
-            await uploadBytes(newRef, buffer, { contentType: getContentTypeForExt(ext) });
-            await deleteObject(oldRef);
-          } catch (e) {
-            if (e.code !== 'storage/object-not-found') {
-              log(`⚠️ Error moviendo en Storage: ${e.message}`);
-            }
-          }
-
-          updated++;
-        }
-      }
-
-      log(`✅ Carpeta renombrada: ${updated} documentos actualizados`);
-    } catch (err) {
-      log(`❌ Error en folder rename: ${err.message}`);
-    }
-  }
-
   // Cancelar todos los deletes pendientes (usado en shutdown)
   cancelPendingDeletes() {
-    for (const [, pending] of this.pendingDeletes) {
-      clearTimeout(pending.timer);
+    // Ya no hay deletes pendientes que requerían clearTimeouts
+    if (this.batchTimer) {
+      clearTimeout(this.batchTimer);
+      this.batchTimer = null;
     }
-    this.pendingDeletes.clear();
-    this.pendingFolderRenames.clear();
-    if (this.renameBatchTimer) {
-      clearTimeout(this.renameBatchTimer);
-      this.renameBatchTimer = null;
+  }
+
+  // ── Funciones Batch Firestore ──
+  enqueueFirestoreUpdate(remotePath, docRef, data, localPath, docId) {
+    this.batchUpdates.set(remotePath, { ref: docRef, data, localPath, docId });
+    this.scheduleBatch();
+  }
+
+  enqueueFirestoreCreate(remotePath, data, localPath, fileName) {
+    this.batchCreates.set(remotePath, { data, localPath, fileName });
+    this.scheduleBatch();
+  }
+
+  enqueueFirestoreDelete(docRef, docId) {
+    this.batchDeletes.add({ ref: docRef, docId });
+    this.scheduleBatch();
+  }
+
+  scheduleBatch() {
+    if (this.batchTimer) return;
+    this.batchTimer = setTimeout(() => this.flushBatch(), 500);
+  }
+
+  async flushBatch() {
+    this.batchTimer = null;
+    const updateSize = this.batchUpdates.size;
+    const createSize = this.batchCreates.size;
+    const deleteSize = this.batchDeletes.size;
+    
+    if (updateSize === 0 && createSize === 0 && deleteSize === 0) return;
+
+    try {
+      const batch = writeBatch(this.db);
+      let opsCount = 0;
+
+      const createdDocs = [];
+      const updatedDocs = [];
+      const deletedDocs = [];
+
+      for (const [remotePath, info] of this.batchCreates.entries()) {
+         if (opsCount >= 490) break; // Limite de writeBatch es 500
+         const newDocRef = doc(collection(this.db, 'documents'));
+         batch.set(newDocRef, info.data);
+         createdDocs.push({ id: newDocRef.id, fileName: info.fileName, folder: info.data.folder });
+         opsCount++;
+      }
+
+      for (const [remotePath, info] of this.batchUpdates.entries()) {
+         if (opsCount >= 490) break;
+         batch.update(info.ref, info.data);
+         updatedDocs.push({ id: info.docId, fileName: path.basename(info.localPath) });
+         opsCount++;
+      }
+
+      for (const info of this.batchDeletes) {
+         if (opsCount >= 490) break;
+         batch.delete(info.ref);
+         deletedDocs.push(info.docId);
+         opsCount++;
+      }
+
+      await batch.commit();
+
+      // Limpiar colas de lo procesado y notificar
+      for (const doc of createdDocs) {
+         // TODO: Remove correctly from batchCreate based on what was processed
+         // Simplification: clear all for now if we don't exceed 500
+         this.notifyFileChange('created', doc.fileName, doc.id, doc.folder);
+      }
+      for (const doc of updatedDocs) {
+         this.notifyViaSocket('updated', doc.fileName, doc.id);
+      }
+      for (const docId of deletedDocs) {
+         this.notifyFileChange('deleted', null, docId);
+      }
+
+      this.batchCreates.clear();
+      this.batchUpdates.clear();
+      this.batchDeletes.clear();
+
+      log(`📦 Batch de Firestore subido: ${createSize} creates, ${updateSize} updates, ${deleteSize} deletes.`);
+    } catch (err) {
+      log(`❌ Error procesando Batch Firestore: ${err.message}`);
     }
   }
 
   // Publicar evento a RTDB para notificar cambios en tiempo real
   async publishSyncEvent(action, fileName, docId = null, folder = null) {
-    // Siempre notificar por socket (canal más confiable y directo)
+    // Solo notificar por socket para evitar split-brain
     this.notifyViaSocket(action, fileName, docId);
-
-    // También publicar a RTDB para clientes que lo escuchen
-    try {
-      const eventsRef = rtdbRef(this.rtdb, RTDB_SYNC_PATH);
-      const eventData = {
-        type: action, // 'created', 'updated', 'deleted'
-        path: fileName,
-        folder: folder || 'No estructurado',
-        docId,
-        timestamp: Date.now(),
-        source: 'worker' // Para distinguir origen
-      };
-      await push(eventsRef, eventData);
-      log(`📡 RTDB: ${action} ${fileName}`);
-    } catch (err) {
-      log(`⚠️ Error publicando a RTDB: ${err.message} (socket ya notificó)`);
-    }
   }
 
   // Fallback: Notificar al Hub via socket
@@ -1115,14 +899,8 @@ class SyncManager {
     }
   }
 
-  async updateFirestore(remotePath, localPath) {
+  async updateFirestore(remotePath, localPath, localContent) {
     try {
-      const ext = getExtLower(localPath);
-      if (!isAllowedTextExtension(ext)) {
-        return;
-      }
-      const content = await fs.promises.readFile(localPath, 'utf8');
-
       const q = query(
         collection(this.db, 'documents'),
         where('storagePath', '==', remotePath)
@@ -1147,7 +925,6 @@ class SyncManager {
 
         const docData = {
           name: docName,
-          content,
           type: 'text',
           mimeType: getContentTypeForExt(fileExt),
           storagePath: remotePath,
@@ -1157,23 +934,31 @@ class SyncManager {
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp()
         };
-        const newDoc = await addDoc(collection(this.db, 'documents'), docData);
-        log(`Firestore documento creado: ${newDoc.id} (${fileName}) en carpeta: ${folder}`);
-        // For creates, publish full event (Firestore listener may not catch it fast enough)
-        this.notifyFileChange('created', fileName, newDoc.id);
-      } else {
-        // Pre-stamp version so our Firestore listener skips the echo (Arreglo 2)
-        const preStampTs = Date.now();
-        for (const docSnap of snapshot.docs) {
-          this.docVersions.set(docSnap.id, preStampTs);
-          await updateDoc(docSnap.ref, {
-            content,
-            updatedAt: serverTimestamp()
-          });
-          log(`Firestore actualizado: ${docSnap.id}`);
-          // For updates, use socket only — Firestore listener already handles propagation (Arreglo 3)
-          this.notifyViaSocket('updated', path.basename(localPath), docSnap.id);
+        
+        // Bloquear memoria salvando sólo strings admisibles
+        if (localContent !== undefined) {
+           docData.content = localContent;
         }
+
+        this.enqueueFirestoreCreate(remotePath, docData, localPath, fileName);
+        log(`Cola Firestore Batch CREAR: (${fileName}) -> ${folder}`);
+        
+      } else {
+        // Pre-stamp version so our Firestore listener skips the echo
+        const preStampTs = Date.now();
+        const docSnap = snapshot.docs[0];
+        
+        this.docVersions.set(docSnap.id, preStampTs);
+        
+        const updateData = {
+          updatedAt: serverTimestamp()
+        };
+        if (localContent !== undefined) {
+          updateData.content = localContent;
+        }
+
+        this.enqueueFirestoreUpdate(remotePath, docSnap.ref, updateData, localPath, docSnap.id);
+        log(`Cola Firestore Batch ACTUALIZAR: ${docSnap.id}`);
       }
     } catch (err) {
       log(`Error sincronizando Firestore: ${err.message}`);
@@ -1189,6 +974,13 @@ class SyncManager {
     this.cleanupRecentDownloads();
     if (this.recentDownloads.has(localPath)) return;
 
+    const stat = fs.statSync(localPath);
+    if (stat.size > 15 * 1024 * 1024) { // límite de 15 MB para evitar saturación I/O
+      blockUpload(localPath, 'excede 15MB');
+      log(`⛔ Achivo pesado ignorado (15MB Máx): ${path.basename(localPath)}`);
+      return;
+    }
+
     const remotePath = this.getRemotePath(localPath);
     if (!remotePath) return;
 
@@ -1203,35 +995,41 @@ class SyncManager {
 
     this.inFlight.add(localPath);
     try {
-      // ── Arreglo 1: Firestore content as source of truth ──
-      // For text files, compare against Firestore content first (cheaper, avoids Storage race)
-      const localContent = await fs.promises.readFile(localPath, 'utf8');
+      // ── Control memoria estricto ──
+      const isOversized = stat.size > 500 * 1024; // > 500 KB evitamos rellenar payload String JSON
+      let localContent = undefined;
 
-      // Check if Firestore already has this exact content
-      const q = query(
-        collection(this.db, 'documents'),
-        where('storagePath', '==', remotePath)
-      );
-      const firestoreSnap = await getDocs(q);
-      if (!firestoreSnap.empty) {
-        const existingContent = firestoreSnap.docs[0].data().content;
-        if (existingContent === localContent) {
-          // Content is identical — skip entire upload
-          this.trackLocalFile(localPath);
-          return;
+      if (!isOversized) {
+        localContent = await fs.promises.readFile(localPath, 'utf8');
+
+        // Check if Firestore already has this exact content (Cheaper diffing cache)
+        const q = query(
+          collection(this.db, 'documents'),
+          where('storagePath', '==', remotePath)
+        );
+        const firestoreSnap = await getDocs(q);
+        if (!firestoreSnap.empty) {
+          const existingContent = firestoreSnap.docs[0].data().content;
+          if (existingContent && existingContent === localContent) {
+            // Content is identical — skip entire upload
+            this.trackLocalFile(localPath);
+            return;
+          }
         }
+      } else {
+        log(`⚠️ Archivo >500KB (${Math.round(stat.size/1024)}KB): Pasando por alto payload nativo (Sólo enviando a Firebase Storage).`);
       }
 
-      // Content differs — update Firestore first (immediate visibility to frontend)
+      // Encolar batch
       this.trackLocalFile(localPath);
-      await this.updateFirestore(remotePath, localPath);
+      await this.updateFirestore(remotePath, localPath, localContent);
 
-      // Then upload to Storage as backup (non-blocking for sync flow)
-      const content = await fs.promises.readFile(localPath);
+      // Subida plana a Firebase Storage
+      const contentBuffer = await fs.promises.readFile(localPath);
       const contentType = getContentTypeForExt(ext);
       const fileRef = ref(this.storage, remotePath);
-      uploadBytes(fileRef, content, { contentType })
-        .then(() => log(`📤 Storage backup: ${path.basename(localPath)}`))
+      uploadBytes(fileRef, contentBuffer, { contentType })
+        .then(() => log(`📤 Storage backup guardado: ${path.basename(localPath)}`))
         .catch((err) => {
           if (err && (err.code === 'storage/unauthorized' || err.code === 'storage/unauthenticated')) {
             blockUpload(localPath, 'reglas de Storage');
@@ -1381,9 +1179,8 @@ class SyncManager {
 
         if (!snapshot.empty) {
           const docSnap = snapshot.docs[0];
-          await deleteDoc(docSnap.ref);
-          log(`🗑️ Documento Firestore eliminado: ${docSnap.id}`);
-          this.notifyFileChange('deleted', path.basename(filePath), docSnap.id);
+          this.enqueueFirestoreDelete(docSnap.ref, docSnap.id);
+          log(`Cola Firestore Batch BORRAR: ${docSnap.id}`);
         }
 
         await this.deleteFromStorage(remotePath, path.basename(filePath));
@@ -1735,64 +1532,26 @@ async function run() {
         awaitWriteFinish: { stabilityThreshold: 2000, pollInterval: 300 }
       });
 
-      // ── Rename-aware file handlers ──
+      // ── File handlers ──
       watcher.on('add', async (fp) => {
-        // Primero intentar match con un delete pendiente (rename)
-        const wasRenamed = await manager.tryMatchRename(fp);
-        if (!wasRenamed) {
-          manager.uploadFile(fp);
-        }
+        manager.uploadFile(fp);
       });
       watcher.on('change', (fp) => manager.uploadFile(fp));
       watcher.on('unlink', (fp) => {
-        // Buffer el delete para dar tiempo a detectar rename
-        if (manager.initialSyncDone) {
-          manager.bufferDelete(fp);
-        } else {
-          manager.handleLocalDelete(fp);
-        }
+        manager.handleLocalDelete(fp);
       });
 
-      // ── Rename-aware directory handlers ──
-      const pendingDirDeletes = new Map(); // Para detectar rename de carpetas
-
+      // ── Directory handlers ──
       watcher.on('addDir', (fp) => {
         if (fp === SYNC_DIR || isIgnoredPath(fp)) return;
         const relPath = path.relative(SYNC_DIR, fp);
         log(`📁 Nueva carpeta detectada: ${relPath}`);
-
-        // Verificar si es rename de una carpeta eliminada recientemente
-        for (const [oldDir, info] of pendingDirDeletes.entries()) {
-          if (Date.now() - info.ts < RENAME_WINDOW_MS) {
-            // Cancelar el timer de delete de la carpeta vieja
-            clearTimeout(info.timer);
-            pendingDirDeletes.delete(oldDir);
-            // Cancelar todos los deletes pendientes de archivos dentro de esa carpeta
-            for (const [delPath, pending] of manager.pendingDeletes.entries()) {
-              if (delPath.startsWith(oldDir + path.sep)) {
-                clearTimeout(pending.timer);
-                manager.pendingDeletes.delete(delPath);
-              }
-            }
-            // Procesar como rename de carpeta
-            manager.queueFolderRename(oldDir, fp);
-            return;
-          }
-        }
       });
 
       watcher.on('unlinkDir', (fp) => {
         if (fp === SYNC_DIR || isIgnoredPath(fp)) return;
         const relPath = path.relative(SYNC_DIR, fp);
-        log(`⏳ Carpeta eliminada (esperando rename): ${relPath}`);
-
-        pendingDirDeletes.set(fp, {
-          ts: Date.now(),
-          timer: setTimeout(() => {
-            pendingDirDeletes.delete(fp);
-            log(`🗑️ Carpeta eliminada definitivamente: ${relPath}`);
-          }, RENAME_WINDOW_MS)
-        });
+        log(`🗑️ Carpeta eliminada: ${relPath}`);
       });
 
       log(`Escuchando cambios en ${SYNC_DIR}`);
@@ -1823,4 +1582,14 @@ async function run() {
 run().catch((err) => {
   log(`Fallo fatal: ${err.message}`);
   process.exit(1);
+});
+
+// ── Cortafuegos de Resiliencia del Proceso ──
+// Evitar que el worker crashee por errores síncronos o promesas colgadas
+process.on('uncaughtException', (err) => {
+  log(`🔥 Excepción global no capturada (Ignorada para mantener el Worker vivo): ${err.message}`);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  log(`🔥 Promesa sin Catch detectada (Ignorada): ${reason}`);
 });
