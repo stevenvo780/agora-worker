@@ -83,7 +83,7 @@ RUN npm install -g \
     nodemon \
     live-server \
     http-server \
-    @stevenvo780/st-lang@3.0.1 \
+    @stevenvo780/st-lang@3.0.2 \
     @openai/codex \
     @anthropic-ai/claude-code \
     @google/gemini-cli
