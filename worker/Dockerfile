@@ -67,7 +67,7 @@ RUN mkdir -p /etc/apt/keyrings && \
     apt-get update && apt-get install -y nodejs && \
     rm -rf /var/lib/apt/lists/*
 
-ARG ST_LANG_VERSION=3.1.3
+ARG ST_LANG_VERSION=3.2.1
 ENV ST_LANG_VERSION=${ST_LANG_VERSION}
 
 # Install eza (modern ls replacement with colors + icons)
