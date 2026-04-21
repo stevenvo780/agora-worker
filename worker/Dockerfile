@@ -67,6 +67,9 @@ RUN mkdir -p /etc/apt/keyrings && \
     apt-get update && apt-get install -y nodejs && \
     rm -rf /var/lib/apt/lists/*
 
+ARG ST_LANG_VERSION=3.1.3
+ENV ST_LANG_VERSION=${ST_LANG_VERSION}
+
 # Install eza (modern ls replacement with colors + icons)
 RUN mkdir -p /etc/apt/keyrings && \
     wget -qO- https://raw.githubusercontent.com/eza-community/eza/main/deb.asc | gpg --dearmor -o /etc/apt/keyrings/gierens.gpg && \
@@ -83,7 +86,7 @@ RUN npm install -g \
     nodemon \
     live-server \
     http-server \
-    @stevenvo780/st-lang@3.0.2 \
+    @stevenvo780/st-lang@${ST_LANG_VERSION} \
     @openai/codex \
     @anthropic-ai/claude-code \
     @google/gemini-cli
