@@ -70,6 +70,9 @@ RUN mkdir -p /etc/apt/keyrings && \
 ARG ST_LANG_VERSION=3.2.2
 ENV ST_LANG_VERSION=${ST_LANG_VERSION}
 
+# Vendored local build of ST so workers can ship the patched runtime
+COPY vendor/stevenvo780-st-lang-3.2.2.tgz /tmp/stevenvo780-st-lang.tgz
+
 # Install eza (modern ls replacement with colors + icons)
 RUN mkdir -p /etc/apt/keyrings && \
     wget -qO- https://raw.githubusercontent.com/eza-community/eza/main/deb.asc | gpg --dearmor -o /etc/apt/keyrings/gierens.gpg && \
@@ -86,7 +89,7 @@ RUN npm install -g \
     nodemon \
     live-server \
     http-server \
-    @stevenvo780/st-lang@${ST_LANG_VERSION} \
+    /tmp/stevenvo780-st-lang.tgz \
     @openai/codex \
     @anthropic-ai/claude-code \
     @google/gemini-cli
