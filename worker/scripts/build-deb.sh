@@ -12,6 +12,18 @@ PY
 
 BUILD_DIR="$ROOT_DIR/build/deb"
 DIST_DIR="$ROOT_DIR/dist"
+WORKER_ENV_SOURCE="$ROOT_DIR/packaging/worker.env"
+WORKER_ENV_EXAMPLE="$ROOT_DIR/packaging/worker.env.example"
+SERVICE_ACCOUNT_SOURCE="$ROOT_DIR/packaging/serviceAccountKey.json"
+SERVICE_ACCOUNT_PLACEHOLDER="$ROOT_DIR/build/serviceAccountKey.placeholder.json"
+
+if [ -f "$WORKER_ENV_SOURCE" ]; then
+  WORKER_ENV_FILE="$WORKER_ENV_SOURCE"
+else
+  WORKER_ENV_FILE="$WORKER_ENV_EXAMPLE"
+  echo "⚠️  packaging/worker.env no existe; se empaquetará worker.env.example como placeholder local."
+  echo "   En producción se conservará /etc/edu-worker/worker.env si ya existe gracias a --force-confold."
+fi
 
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR/DEBIAN" \
@@ -22,12 +34,22 @@ mkdir -p "$BUILD_DIR/DEBIAN" \
   "$BUILD_DIR/usr/share/doc/edu-worker" \
   "$BUILD_DIR/var/lib/edu-worker/workspaces"
 
+if [ -f "$SERVICE_ACCOUNT_SOURCE" ]; then
+  SERVICE_ACCOUNT_FILE="$SERVICE_ACCOUNT_SOURCE"
+else
+  mkdir -p "$(dirname "$SERVICE_ACCOUNT_PLACEHOLDER")"
+  printf '{}\n' > "$SERVICE_ACCOUNT_PLACEHOLDER"
+  SERVICE_ACCOUNT_FILE="$SERVICE_ACCOUNT_PLACEHOLDER"
+  echo "⚠️  packaging/serviceAccountKey.json no existe; se empaquetará un placeholder vacío local."
+  echo "   En producción se conservará /etc/edu-worker/serviceAccountKey.json si ya existe gracias a --force-confold."
+fi
+
 install -m 755 "$ROOT_DIR/packaging/edu-worker" "$BUILD_DIR/usr/bin/edu-worker"
 install -m 755 "$ROOT_DIR/packaging/edu-worker-manager" "$BUILD_DIR/usr/bin/edu-worker-manager"
 install -m 644 "$ROOT_DIR/packaging/edu-worker.service" "$BUILD_DIR/lib/systemd/system/edu-worker.service"
-install -m 600 "$ROOT_DIR/packaging/worker.env" "$BUILD_DIR/etc/edu-worker/worker.env"
-install -m 600 "$ROOT_DIR/packaging/serviceAccountKey.json" "$BUILD_DIR/etc/edu-worker/serviceAccountKey.json"
-install -m 644 "$ROOT_DIR/packaging/worker.env" "$BUILD_DIR/usr/share/doc/edu-worker/worker.env.example"
+install -m 600 "$WORKER_ENV_FILE" "$BUILD_DIR/etc/edu-worker/worker.env"
+install -m 600 "$SERVICE_ACCOUNT_FILE" "$BUILD_DIR/etc/edu-worker/serviceAccountKey.json"
+install -m 644 "$WORKER_ENV_EXAMPLE" "$BUILD_DIR/usr/share/doc/edu-worker/worker.env.example"
 
 cat > "$BUILD_DIR/DEBIAN/control" << EOF
 Package: edu-worker
