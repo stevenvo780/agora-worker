@@ -7,15 +7,14 @@ import { initializeApp } from 'firebase/app';
 import { getAuth, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
 import {
   getFirestore, collection, query, where, onSnapshot,
-  getDocs, addDoc, updateDoc, deleteDoc,
-  serverTimestamp, increment, writeBatch, doc
+  getDocs, serverTimestamp, writeBatch, doc
 } from 'firebase/firestore';
 import {
   getStorage, ref, uploadBytes,
   getMetadata, deleteObject, getBytes, listAll
 } from 'firebase/storage';
 import {
-  getDatabase, ref as rtdbRef, push, onChildAdded, remove
+  getDatabase, ref as rtdbRef, onChildAdded, remove
 } from 'firebase/database';
 import { io } from 'socket.io-client';
 
@@ -108,7 +107,7 @@ const SYNC_USER = process.env.SYNC_USER || 'estudiante';
  * Fix ownership of a file/directory. Desactivado por seguridad.
  * No se debe hacer sudo chown desde Node.js (RCE Vulnerability)
  */
-function fixOwnership(targetPath) {
+function fixOwnership() {
   return false;
 }
 
@@ -347,16 +346,6 @@ function blockUpload(localPath, reason) {
   blockedUploads.set(localPath, { ts: Date.now(), reason });
 }
 
-function md5Base64(filePath) {
-  return new Promise((resolve, reject) => {
-    const hash = crypto.createHash('md5');
-    const stream = fs.createReadStream(filePath);
-    stream.on('data', (chunk) => hash.update(chunk));
-    stream.on('error', reject);
-    stream.on('end', () => resolve(hash.digest('base64')));
-  });
-}
-
 class SyncManager {
   constructor(storage, db, socket, rtdb) {
     this.storage = storage;
@@ -472,7 +461,7 @@ class SyncManager {
     const updateSize = this.batchUpdates.size;
     const createSize = this.batchCreates.size;
     const deleteSize = this.batchDeletes.size;
-    
+
     if (updateSize === 0 && createSize === 0 && deleteSize === 0) return;
 
     try {
@@ -483,7 +472,7 @@ class SyncManager {
       const updatedDocs = [];
       const deletedDocs = [];
 
-      for (const [remotePath, info] of this.batchCreates.entries()) {
+      for (const [, info] of this.batchCreates.entries()) {
          if (opsCount >= 490) break; // Limite de writeBatch es 500
          const newDocRef = doc(collection(this.db, 'documents'));
          batch.set(newDocRef, info.data);
@@ -491,7 +480,7 @@ class SyncManager {
          opsCount++;
       }
 
-      for (const [remotePath, info] of this.batchUpdates.entries()) {
+      for (const [, info] of this.batchUpdates.entries()) {
          if (opsCount >= 490) break;
          batch.update(info.ref, info.data);
          updatedDocs.push({ id: info.docId, fileName: path.basename(info.localPath) });
@@ -531,7 +520,7 @@ class SyncManager {
   }
 
   // Publicar evento a RTDB para notificar cambios en tiempo real
-  async publishSyncEvent(action, fileName, docId = null, folder = null) {
+  publishSyncEvent(action, fileName, docId = null) {
     // Solo notificar por socket para evitar split-brain
     this.notifyViaSocket(action, fileName, docId);
   }
@@ -549,8 +538,8 @@ class SyncManager {
   }
 
   // Alias para compatibilidad
-  notifyFileChange(action, fileName, docId = null, folder = null) {
-    this.publishSyncEvent(action, fileName, docId, folder);
+  notifyFileChange(action, fileName, docId = null) {
+    this.publishSyncEvent(action, fileName, docId);
   }
 
   // Configurar listener de RTDB para eventos del frontend
@@ -934,7 +923,7 @@ class SyncManager {
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp()
         };
-        
+
         // Bloquear memoria salvando sólo strings admisibles
         if (localContent !== undefined) {
            docData.content = localContent;
@@ -942,14 +931,14 @@ class SyncManager {
 
         this.enqueueFirestoreCreate(remotePath, docData, localPath, fileName);
         log(`Cola Firestore Batch CREAR: (${fileName}) -> ${folder}`);
-        
+
       } else {
         // Pre-stamp version so our Firestore listener skips the echo
         const preStampTs = Date.now();
         const docSnap = snapshot.docs[0];
-        
+
         this.docVersions.set(docSnap.id, preStampTs);
-        
+
         const updateData = {
           updatedAt: serverTimestamp()
         };
@@ -1017,7 +1006,7 @@ class SyncManager {
           }
         }
       } else {
-        log(`⚠️ Archivo >500KB (${Math.round(stat.size/1024)}KB): Pasando por alto payload nativo (Sólo enviando a Firebase Storage).`);
+        log(`⚠️ Archivo >500KB (${Math.round(stat.size / 1024)}KB): Pasando por alto payload nativo (Sólo enviando a Firebase Storage).`);
       }
 
       // Encolar batch
@@ -1590,6 +1579,6 @@ process.on('uncaughtException', (err) => {
   log(`🔥 Excepción global no capturada (Ignorada para mantener el Worker vivo): ${err.message}`);
 });
 
-process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', (reason) => {
   log(`🔥 Promesa sin Catch detectada (Ignorada): ${reason}`);
 });
