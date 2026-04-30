@@ -138,6 +138,20 @@ const writeState = async (wsDir, state) =>
 
 const BUILTIN_IGNORE_RULES = compileIgnore(BUILTIN_IGNORE_TEXT);
 
+// Circuit breaker: tras N fallos consecutivos del mismo path o workspace,
+// dejar de intentar y solo loggear cada 30 ciclos. Evita inundar el log con
+// 404s repetidos (blobs huérfanos) o 500s (workspaces que ya no existen en
+// Firestore pero el contenedor sigue corriendo).
+const FAIL_THRESHOLD = 3;
+const SILENCE_EVERY = 30;
+const failCounter = new Map();
+const shouldFailLog = (key) => {
+    const n = (failCounter.get(key) ?? 0) + 1;
+    failCounter.set(key, n);
+    return n <= FAIL_THRESHOLD || (n % SILENCE_EVERY === 0);
+};
+const clearFailCounter = (key) => failCounter.delete(key);
+
 const readSyncignore = async (wsDir) => {
     let userRules = [];
     try {
@@ -251,8 +265,17 @@ const syncOne = async (wsId) => {
         const local = localByPath.get(safe);
         const tracked = state[safe];
 
-        if (local && local.hash === item.contentHash) {
-            state[safe] = item.contentHash;
+        // Si ya tenemos un sync establecido (state guardado) y el archivo
+        // local no cambió respecto a state, no redescargar aunque el
+        // contentHash del server difiera — algunos docs antiguos tienen
+        // hashes inconsistentes (migración o cliente que computó mal).
+        // Trustear el state local evita un loop infinito de re-pull.
+        if (local && tracked && local.hash === tracked) {
+            skipped++;
+            continue;
+        }
+        if (local && !tracked && local.hash === item.contentHash) {
+            state[safe] = local.hash;
             skipped++;
             continue;
         }
@@ -268,11 +291,12 @@ const syncOne = async (wsId) => {
             await writeFile(localPath, buf);
             state[safe] = sha256(buf);
             localByPath.set(safe, { buf, hash: state[safe], size: buf.length });
+            clearFailCounter(`pull:${wsId}:${safe}`);
             downloaded++;
             verbose('  ↓', safe);
         } catch (e) {
             failed++;
-            log('  pull fail', safe, e.message);
+            if (shouldFailLog(`pull:${wsId}:${safe}`)) log('  pull fail', safe, e.message);
         }
     }
 
@@ -281,17 +305,19 @@ const syncOne = async (wsId) => {
         if (isIgnored(repoPath)) continue;
         const tracked = state[repoPath];
         const remote = remoteByPath.get(repoPath);
-        if (remote && remote.contentHash === info.hash) { state[repoPath] = info.hash; continue; }
+        // Hash local coincide con tracked → no cambió localmente → skip.
         if (tracked && tracked === info.hash) continue;
+        if (remote && remote.contentHash === info.hash) { state[repoPath] = info.hash; continue; }
         try {
             const result = await pushFile(wsId, repoPath, info);
             state[repoPath] = info.hash;
+            clearFailCounter(`push:${wsId}:${repoPath}`);
             uploaded++;
             if (result.created) created++;
             verbose('  ↑', repoPath, result.created ? '(NEW)' : `v${result.version}`);
         } catch (e) {
             failed++;
-            log('  push fail', repoPath, e.message);
+            if (shouldFailLog(`push:${wsId}:${repoPath}`)) log('  push fail', repoPath, e.message);
         }
     }
 
