@@ -10,7 +10,7 @@
  */
 import { spawn } from 'node:child_process';
 import { createHash, createHmac } from 'node:crypto';
-import { mkdir, writeFile, readFile, stat, readdir } from 'node:fs/promises';
+import { mkdir, writeFile, readFile, stat, readdir, rm } from 'node:fs/promises';
 import path from 'node:path';
 
 const HUB_URL = process.env.AGORA_HUB_URL ?? 'https://agora.elenxos.com';
@@ -238,113 +238,174 @@ const syncOne = async (wsId) => {
     const remoteByPath = new Map(data.items.map(i => [i.repoPath, i]));
 
     const localByPath = await walkLocal(wsDir);
-    const state = await readState(wsDir);
+    const rawState = await readState(wsDir);
+    // El state legacy era `{ path: hashString }`; lo migramos sobre la marcha al
+    // formato dual `{ path: { localHash, remoteHash } }` la primera vez.
+    const state = {};
+    for (const [k, v] of Object.entries(rawState)) {
+        state[k] = typeof v === 'string' ? { localHash: v, remoteHash: v } : v;
+    }
     // .syncignore se aplica DESPUÉS del walk para que el archivo `.syncignore`
     // mismo se sincronice (jamás se ignora a sí mismo).
     const ignoreRules = await readSyncignore(wsDir);
     const isIgnored = (relPath) => relPath !== '.syncignore' && relPath !== '.gitignore' && matchIgnore(ignoreRules, relPath);
 
     let downloaded = 0, uploaded = 0, skipped = 0, failed = 0, created = 0, purged = 0;
+    let deletedLocal = 0, deletedRemote = 0;
 
-    for (const [repoPath, item] of remoteByPath) {
-        const safe = repoPath.replace(/^\/+/, '');
+    // Conjunto canónico de paths a procesar: union(local ∪ remote ∪ tracked).
+    const allPaths = new Set([
+        ...localByPath.keys(),
+        ...remoteByPath.keys(),
+        ...Object.keys(state)
+    ]);
+
+    for (const safe of allPaths) {
         if (isHardSkipped(safe)) { skipped++; continue; }
+        const remote = remoteByPath.get(safe);
+        const local = localByPath.get(safe);
+
+        // .syncignore — purga zombies del NAS y borra local si está.
         if (isIgnored(safe)) {
-            // Zombie: el .syncignore lo prohíbe pero está en el NAS. Borrar.
+            if (remote) {
+                try {
+                    await deleteRemote(wsId, safe);
+                    purged++;
+                    verbose('  ✗', safe, '(by .syncignore)');
+                } catch (e) {
+                    verbose('purge fail', safe, e.message);
+                }
+            }
+            if (local) {
+                try { await rm(path.join(wsDir, safe), { force: true }); } catch { /* noop */ }
+            }
+            delete state[safe];
+            continue;
+        }
+
+        const tracked = state[safe];
+        const trackedLocal = tracked?.localHash ?? null;
+        const trackedRemote = tracked?.remoteHash ?? null;
+
+        const localChanged = !!local && local.hash !== trackedLocal;
+        const remoteChanged = !!remote && remote.contentHash !== trackedRemote;
+        const localDeleted = !local && !!trackedLocal;
+        const remoteDeleted = !remote && !!trackedRemote;
+        const isFresh = !tracked;
+
+        // 1) Ambos lados borrados → limpia state.
+        if (!local && !remote) { delete state[safe]; continue; }
+
+        // 2) Cambio remoto (incluye archivo nuevo en NAS sin tracked) → pull,
+        //    a menos que también haya cambio local (conflicto: server gana).
+        if (remoteChanged || (isFresh && remote && !local)) {
+            if (!remote.signedUrl) { failed++; continue; }
             try {
-                await deleteRemote(wsId, safe);
-                delete state[safe];
-                purged++;
-                verbose('  ✗', safe, '(purged by .syncignore)');
+                const buf = await fetchBuf(remote.signedUrl);
+                const fullPath = path.join(wsDir, safe);
+                await mkdir(path.dirname(fullPath), { recursive: true });
+                await writeFile(fullPath, buf);
+                const newHash = sha256(buf);
+                state[safe] = { localHash: newHash, remoteHash: remote.contentHash };
+                clearFailCounter(`pull:${wsId}:${safe}`);
+                downloaded++;
+                verbose('  ↓', safe);
             } catch (e) {
-                verbose('purge fail', safe, e.message);
-                skipped++;
+                failed++;
+                if (shouldFailLog(`pull:${wsId}:${safe}`)) log('  pull fail', safe, e.message);
             }
             continue;
         }
-        const local = localByPath.get(safe);
-        const tracked = state[safe];
 
-        // Si ya tenemos un sync establecido (state guardado) y el archivo
-        // local no cambió respecto a state, no redescargar aunque el
-        // contentHash del server difiera — algunos docs antiguos tienen
-        // hashes inconsistentes (migración o cliente que computó mal).
-        // Trustear el state local evita un loop infinito de re-pull.
-        if (local && tracked && local.hash === tracked) {
-            skipped++;
+        // 3) Borrado remoto — propaga al worker.
+        if (remoteDeleted && local) {
+            try {
+                await rm(path.join(wsDir, safe), { force: true });
+                delete state[safe];
+                deletedLocal++;
+                verbose('  ✗ local', safe);
+            } catch (e) {
+                failed++;
+                if (shouldFailLog(`del-local:${wsId}:${safe}`)) log('  delete-local fail', safe, e.message);
+            }
             continue;
         }
-        if (local && !tracked && local.hash === item.contentHash) {
-            state[safe] = local.hash;
-            skipped++;
+
+        // 4) Cambio local (incluye archivo nuevo local sin tracked) → push.
+        if (localChanged || (isFresh && local && !remote)) {
+            try {
+                const result = await pushFile(wsId, safe, local);
+                state[safe] = { localHash: local.hash, remoteHash: local.hash };
+                clearFailCounter(`push:${wsId}:${safe}`);
+                uploaded++;
+                if (result.created) created++;
+                verbose('  ↑', safe, result.created ? '(NEW)' : `v${result.version}`);
+            } catch (e) {
+                failed++;
+                if (shouldFailLog(`push:${wsId}:${safe}`)) log('  push fail', safe, e.message);
+            }
             continue;
         }
-        // Local cambió pero remoto sigue igual → lo gestiona la fase de push.
-        if (local && tracked && local.hash !== tracked && item.contentHash === tracked) {
+
+        // 5) Borrado local — propaga al NAS.
+        if (localDeleted && remote) {
+            try {
+                await deleteRemote(wsId, safe);
+                delete state[safe];
+                deletedRemote++;
+                verbose('  ✗ remoto', safe);
+            } catch (e) {
+                failed++;
+                if (shouldFailLog(`del-remote:${wsId}:${safe}`)) log('  delete-remote fail', safe, e.message);
+            }
             continue;
         }
-        if (!item.signedUrl) { failed++; continue; }
-        try {
-            const buf = await fetchBuf(item.signedUrl);
-            const localPath = path.join(wsDir, safe);
-            await mkdir(path.dirname(localPath), { recursive: true });
-            await writeFile(localPath, buf);
-            state[safe] = sha256(buf);
-            localByPath.set(safe, { buf, hash: state[safe], size: buf.length });
-            clearFailCounter(`pull:${wsId}:${safe}`);
-            downloaded++;
-            verbose('  ↓', safe);
-        } catch (e) {
-            failed++;
-            if (shouldFailLog(`pull:${wsId}:${safe}`)) log('  pull fail', safe, e.message);
+
+        // 6) Ningún cambio: refresca tracking si vale (cubre el caso de
+        //    servidores con contentHash inconsistente — registramos lo que
+        //    vemos sin re-descargar).
+        if (local && remote) {
+            state[safe] = { localHash: local.hash, remoteHash: remote.contentHash };
         }
+        skipped++;
     }
 
-    for (const [repoPath, info] of localByPath) {
-        if (isHardSkipped(repoPath)) continue;
-        if (isIgnored(repoPath)) continue;
-        const tracked = state[repoPath];
-        const remote = remoteByPath.get(repoPath);
-        // Hash local coincide con tracked → no cambió localmente → skip.
-        if (tracked && tracked === info.hash) continue;
-        if (remote && remote.contentHash === info.hash) { state[repoPath] = info.hash; continue; }
-        try {
-            const result = await pushFile(wsId, repoPath, info);
-            state[repoPath] = info.hash;
-            clearFailCounter(`push:${wsId}:${repoPath}`);
-            uploaded++;
-            if (result.created) created++;
-            verbose('  ↑', repoPath, result.created ? '(NEW)' : `v${result.version}`);
-        } catch (e) {
-            failed++;
-            if (shouldFailLog(`push:${wsId}:${repoPath}`)) log('  push fail', repoPath, e.message);
-        }
-    }
-
-    for (const k of Object.keys(state)) {
-        if (!remoteByPath.has(k) && !localByPath.has(k)) delete state[k];
-    }
     await writeState(wsDir, state);
 
-    if (downloaded || uploaded || failed || purged) {
-        log(`${wsId} → ↓${downloaded} ↑${uploaded}${created ? ` (${created} nuevos)` : ''}${purged ? ` ✗${purged}` : ''} skip:${skipped} fail:${failed}`);
+    if (downloaded || uploaded || failed || purged || deletedLocal || deletedRemote) {
+        const delPart = (deletedLocal || deletedRemote) ? ` ✗L${deletedLocal} ✗R${deletedRemote}` : '';
+        log(`${wsId} → ↓${downloaded} ↑${uploaded}${created ? ` (${created} nuevos)` : ''}${purged ? ` purg:${purged}` : ''}${delPart} skip:${skipped} fail:${failed}`);
     } else {
         verbose(`${wsId} → al día`);
     }
 };
 
+const CONCURRENCY = Number.parseInt(process.env.CONCURRENCY ?? '4', 10);
+
+// Procesa los workspaces en paralelo con un límite de concurrencia, así un
+// workspace gigante (miles de archivos) no bloquea la detección de cambios
+// en los workspaces pequeños.
+const runConcurrent = async (items, fn, limit) => {
+    const queue = [...items];
+    const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+        while (queue.length > 0) {
+            const item = queue.shift();
+            try { await fn(item); }
+            catch (e) { log('worker', item, 'error:', e.message); }
+        }
+    });
+    await Promise.all(workers);
+};
+
 const main = async () => {
-    log(`agora-host-sync iniciado. Hub=${HUB_URL} POLL=${POLL_MS}ms`);
+    log(`agora-host-sync iniciado. Hub=${HUB_URL} POLL=${POLL_MS}ms CONCURRENCY=${CONCURRENCY}`);
     while (true) {
         try {
             const revived = await reviveExitedWorkers();
             if (revived > 0) await new Promise(r => setTimeout(r, 3000));
             const tokens = await listWorkers();
             verbose(`workers activos: ${tokens.length}`);
-            for (const tok of tokens) {
-                try { await syncOne(tok); }
-                catch (e) { log('worker', tok, 'error:', e.message); }
-            }
+            await runConcurrent(tokens, syncOne, CONCURRENCY);
         } catch (e) {
             log('main loop error:', e.message);
         }
