@@ -56,15 +56,43 @@ const fetchBuf = async (url) => {
     return Buffer.from(await r.arrayBuffer());
 };
 
-const listWorkers = () => new Promise((resolve, reject) => {
-    const c = spawn('docker', ['ps', '--filter', 'name=edu-worker-', '--format', '{{.Names}}']);
-    let out = '';
+const dockerCmd = (args) => new Promise((resolve, reject) => {
+    const c = spawn('docker', args);
+    let out = '', err = '';
     c.stdout.on('data', (d) => { out += d.toString(); });
-    c.on('exit', (code) => {
-        if (code !== 0) return reject(new Error(`docker ps exit ${code}`));
-        resolve(out.split('\n').map(s => s.trim()).filter(Boolean).map(n => n.replace(/^edu-worker-/, '')));
-    });
+    c.stderr.on('data', (d) => { err += d.toString(); });
+    c.on('exit', (code) => code === 0 ? resolve(out) : reject(new Error(`docker ${args[0]} exit ${code}: ${err.trim()}`)));
 });
+
+const listWorkers = async () => {
+    const out = await dockerCmd(['ps', '--filter', 'name=edu-worker-', '--format', '{{.Names}}']);
+    return out.split('\n').map(s => s.trim()).filter(Boolean).map(n => n.replace(/^edu-worker-/, ''));
+};
+
+// Devuelve los nombres completos de contenedores `edu-worker-*` Exited.
+const listExitedWorkers = async () => {
+    const out = await dockerCmd(['ps', '-a', '--filter', 'name=edu-worker-', '--filter', 'status=exited', '--format', '{{.Names}}']);
+    return out.split('\n').map(s => s.trim()).filter(Boolean);
+};
+
+// Revive contenedores parados. Cubre: docker stop manual, daemon restart,
+// OOM kill, reboots del host. Loggea quién, exitCode y OOMKilled flag.
+const reviveExitedWorkers = async () => {
+    const exited = await listExitedWorkers();
+    if (exited.length === 0) return 0;
+    let revived = 0;
+    for (const name of exited) {
+        try {
+            const info = await dockerCmd(['inspect', name, '--format', '{{.State.ExitCode}}|{{.State.OOMKilled}}|{{.State.FinishedAt}}']);
+            await dockerCmd(['start', name]);
+            log(`revive ${name} (${info.trim()})`);
+            revived++;
+        } catch (e) {
+            log(`revive fail ${name}: ${e.message}`);
+        }
+    }
+    return revived;
+};
 
 const readState = async (wsDir) => {
     try { return JSON.parse(await readFile(path.join(wsDir, '.agora-host-sync.json'), 'utf8')); }
@@ -215,8 +243,10 @@ const main = async () => {
     log(`agora-host-sync iniciado. Hub=${HUB_URL} POLL=${POLL_MS}ms`);
     while (true) {
         try {
+            const revived = await reviveExitedWorkers();
+            if (revived > 0) await new Promise(r => setTimeout(r, 3000));
             const tokens = await listWorkers();
-            verbose(`workers detectados: ${tokens.length}`);
+            verbose(`workers activos: ${tokens.length}`);
             for (const tok of tokens) {
                 try { await syncOne(tok); }
                 catch (e) { log('worker', tok, 'error:', e.message); }
