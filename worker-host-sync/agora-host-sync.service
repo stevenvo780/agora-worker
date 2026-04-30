@@ -1,0 +1,19 @@
+[Unit]
+Description=Agora host sync — espeja workers con NAS y revive contenedores edu-worker
+After=docker.service network-online.target
+Wants=docker.service network-online.target
+
+[Service]
+Type=simple
+User=stev
+Group=stev
+# WORKER_SECRET se inyecta vía drop-in en /etc/systemd/system/agora-host-sync.service.d/
+EnvironmentFile=-/etc/edu-worker/worker.env
+ExecStart=/usr/bin/node /home/stev/bin/agora-host-sync.mjs
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/stev/logs/agora-host-sync.log
+StandardError=append:/home/stev/logs/agora-host-sync.log
+
+[Install]
+WantedBy=multi-user.target
