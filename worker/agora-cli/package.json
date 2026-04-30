@@ -1,0 +1,15 @@
+{
+  "name": "@agora/cli",
+  "version": "0.1.0",
+  "description": "CLI para clonar, sincronizar y trabajar workspaces de Agora desde tu Linux/Mac/Windows con cualquier editor (VS Code, etc.).",
+  "private": false,
+  "type": "module",
+  "engines": { "node": ">=18" },
+  "bin": {
+    "agora": "src/index.mjs"
+  },
+  "files": ["src", "README.md"],
+  "scripts": {
+    "start": "node src/index.mjs"
+  }
+}

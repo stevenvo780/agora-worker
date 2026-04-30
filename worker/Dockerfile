@@ -132,9 +132,12 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
+# Bundle agora-cli (workspace sync por defecto)
+COPY agora-cli /opt/agora-cli
+RUN cd /opt/agora-cli && npm install --omit=dev --no-audit --no-fund && npm link
+
 # Copy application code
 COPY index.js .
-COPY sync_agent.js .
 COPY entrypoint.sh .
 
 # Clean up any stale serviceAccountKey.json directory from cache

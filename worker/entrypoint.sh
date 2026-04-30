@@ -263,18 +263,43 @@ else
     echo "   Workspace ID: $WORKER_TOKEN"
 fi
 
-# Start Sync Agent in background (auth via Hub Custom Token)
-if [ -n "$WORKER_SECRET" ] && [ -n "$WORKER_TOKEN" ]; then
-    echo "📡 Starting Sync Agent..."
-    LOG_PATH="${SYNC_AGENT_LOG:-/var/log/sync_agent.log}"
-    if ! (mkdir -p "$(dirname "$LOG_PATH")" && touch "$LOG_PATH" 2>/dev/null); then
-        LOG_PATH="${SYNC_AGENT_LOG:-${HOME:-/home/estudiante}/sync_agent.log}"
-        mkdir -p "$(dirname "$LOG_PATH")" 2>/dev/null || true
-        touch "$LOG_PATH" 2>/dev/null || true
+# ── Git workspace bootstrap (no destructivo) ────────────────────
+# Backend = Forgejo (1 repo por workspace) + MinIO. Cada workspace = 1 repo.
+# Si el contenedor recibe AGORA_WORKSPACE_REPO + AGORA_GIT_USER + AGORA_GIT_TOKEN,
+# fusiona /workspace local con el remoto sin perder archivos preexistentes.
+if [ -n "${AGORA_WORKSPACE_REPO:-}" ] && [ -n "${AGORA_GIT_USER:-}" ] && [ -n "${AGORA_GIT_TOKEN:-}" ]; then
+    echo "🌿 Configurando workspace git..."
+    AUTHED_URL=$(echo "$AGORA_WORKSPACE_REPO" | sed -E "s#https?://#https://${AGORA_GIT_USER}:${AGORA_GIT_TOKEN}@#")
+    git -C "${WORKSPACE_DIR}" config user.email "${AGORA_GIT_EMAIL:-${AGORA_GIT_USER}@noreply.agora.local}" || true
+    git -C "${WORKSPACE_DIR}" config user.name  "${AGORA_GIT_USER}" || true
+
+    if [ ! -d "${WORKSPACE_DIR}/.git" ]; then
+        # No es repo todavía. Si hay archivos pre-existentes los preservamos:
+        # init local + add + commit, luego pull --rebase contra remoto.
+        echo "   inicializando repo local sobre /workspace existente..."
+        git -C "${WORKSPACE_DIR}" init -q -b main
+        git -C "${WORKSPACE_DIR}" remote add origin "$AUTHED_URL"
+        # Si hay archivos los committeamos primero para no perderlos.
+        if [ -n "$(ls -A "${WORKSPACE_DIR}" 2>/dev/null | grep -v '^\.git$' || true)" ]; then
+            git -C "${WORKSPACE_DIR}" add -A 2>/dev/null || true
+            git -C "${WORKSPACE_DIR}" commit -m "preexisting workspace at first boot" --allow-empty 2>/dev/null || true
+        else
+            git -C "${WORKSPACE_DIR}" commit --allow-empty -m "init" 2>/dev/null || true
+        fi
+        # Fusionar con remoto sin sobrescribir
+        git -C "${WORKSPACE_DIR}" fetch origin --quiet 2>/dev/null || true
+        git -C "${WORKSPACE_DIR}" pull --rebase --strategy=recursive --strategy-option=ours origin main --no-edit 2>/dev/null || true
+        git -C "${WORKSPACE_DIR}" push -u origin main 2>/dev/null || true
+    else
+        git -C "${WORKSPACE_DIR}" remote set-url origin "$AUTHED_URL"
+        git -C "${WORKSPACE_DIR}" pull --rebase --autostash --quiet 2>/dev/null || true
     fi
-    node /app/sync_agent.js 2>&1 | tee "$LOG_PATH" &
+
+    # Auto-sync con NAS via agora-cli (pull + autocommit + push cada 30s).
+    nohup agora watch "${WORKSPACE_DIR}" >/tmp/agora-watch.log 2>&1 &
+    echo "✅ Git workspace listo (origin: ${AGORA_WORKSPACE_REPO}); agora-cli watch corriendo."
 else
-    echo "⚠️  WORKER_SECRET or WORKER_TOKEN not set. Sync Agent disabled."
+    echo "ℹ️  AGORA_WORKSPACE_REPO/USER/TOKEN no definidos; saltando bootstrap git (workspace local intacto)."
 fi
 
 # Start main Worker process
