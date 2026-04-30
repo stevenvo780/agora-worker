@@ -18,9 +18,44 @@ const WORKER_SECRET = process.env.WORKER_SECRET;
 const BASE_DIR = process.env.BASE_DIR ?? '/home/stev/edu-worker/workspaces';
 const POLL_MS = Number.parseInt(process.env.POLL_MS ?? '5000', 10);
 const VERBOSE = process.env.VERBOSE === '1';
-// Archivos creados por el entrypoint o internos al daemon — no sincronizar.
-const SKIP_PREFIXES = ['.git/', 'repos/', '.agora-host-sync.json', '.syncignore', '.st-guide.md'];
-const SKIP_EXACT = new Set(['.git', 'repos', '.agora-host-sync.json', '.syncignore', '.st-guide.md']);
+// Internos al daemon o al runtime del worker — nunca tocar (en ambas direcciones).
+// `.syncignore` y `.gitignore` SÍ se sincronizan: el user los edita desde la web.
+const HARD_SKIP = ['.git/', 'repos/', '.agora-host-sync.json', '.st-guide.md'];
+
+// Reglas intrínsecas que se aplican aunque el `.syncignore` del workspace no
+// las liste. Cubren archivos temporales de editores que NUNCA deben llegar
+// al NAS (vim swap, lockfiles de LibreOffice, etc.). Siempre activas.
+const BUILTIN_IGNORE_TEXT = [
+    '*.swp', '*.swo', '*.swn',
+    '*~',
+    '.~lock.*', '.#*',
+    '.DS_Store', 'Thumbs.db', 'desktop.ini'
+].join('\n');
+
+const compileIgnore = (txt) => {
+    const lines = txt.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+    return lines.map(line => {
+        const negate = line.startsWith('!');
+        const raw = negate ? line.slice(1) : line;
+        const dirOnly = raw.endsWith('/');
+        const pat = dirOnly ? raw.slice(0, -1) : raw;
+        const escaped = pat.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]');
+        return { negate, dirOnly, regex: new RegExp(`(^|/)${escaped}(/|$)`) };
+    });
+};
+
+const matchIgnore = (rules, path) => {
+    let matched = false;
+    for (const r of rules) {
+        if (r.regex.test(path)) matched = !r.negate;
+    }
+    return matched;
+};
+
+const isHardSkipped = (relPath) => {
+    if (!relPath) return false;
+    return HARD_SKIP.some(p => relPath === p.replace(/\/$/, '') || relPath === p || relPath.startsWith(p));
+};
 
 if (!WORKER_SECRET) {
     console.error('agora-host-sync: WORKER_SECRET requerido');
@@ -101,9 +136,15 @@ const readState = async (wsDir) => {
 const writeState = async (wsDir, state) =>
     writeFile(path.join(wsDir, '.agora-host-sync.json'), JSON.stringify(state, null, 2));
 
-const isSkipped = (relPath) => {
-    if (SKIP_EXACT.has(relPath)) return true;
-    return SKIP_PREFIXES.some(p => relPath === p || relPath.startsWith(p));
+const BUILTIN_IGNORE_RULES = compileIgnore(BUILTIN_IGNORE_TEXT);
+
+const readSyncignore = async (wsDir) => {
+    let userRules = [];
+    try {
+        const txt = await readFile(path.join(wsDir, '.syncignore'), 'utf8');
+        userRules = compileIgnore(txt);
+    } catch { /* sin .syncignore */ }
+    return [...BUILTIN_IGNORE_RULES, ...userRules];
 };
 
 const walkLocal = async (wsDir) => {
@@ -115,7 +156,7 @@ const walkLocal = async (wsDir) => {
         for (const e of entries) {
             const fullPath = path.join(dir, e.name);
             const relPath = rel ? `${rel}/${e.name}` : e.name;
-            if (isSkipped(relPath)) continue;
+            if (isHardSkipped(relPath)) continue;
             if (e.isDirectory()) {
                 await visit(fullPath, relPath);
             } else if (e.isFile()) {
@@ -141,6 +182,14 @@ const guessContentType = (name) => {
     if (lower.endsWith('.css')) return 'text/css';
     if (lower.endsWith('.js') || lower.endsWith('.mjs')) return 'application/javascript';
     return 'application/octet-stream';
+};
+
+const deleteRemote = async (wsId, repoPath) => {
+    const headers = { ...authHeaders(wsId), 'Content-Type': 'application/json' };
+    return fetchJson(`${HUB_URL}/api/sync/worker-delete`, {
+        method: 'POST', headers,
+        body: JSON.stringify({ repoPath })
+    });
 };
 
 const pushFile = async (wsId, repoPath, info) => {
@@ -176,11 +225,29 @@ const syncOne = async (wsId) => {
 
     const localByPath = await walkLocal(wsDir);
     const state = await readState(wsDir);
-    let downloaded = 0, uploaded = 0, skipped = 0, failed = 0, created = 0;
+    // .syncignore se aplica DESPUÉS del walk para que el archivo `.syncignore`
+    // mismo se sincronice (jamás se ignora a sí mismo).
+    const ignoreRules = await readSyncignore(wsDir);
+    const isIgnored = (relPath) => relPath !== '.syncignore' && relPath !== '.gitignore' && matchIgnore(ignoreRules, relPath);
+
+    let downloaded = 0, uploaded = 0, skipped = 0, failed = 0, created = 0, purged = 0;
 
     for (const [repoPath, item] of remoteByPath) {
         const safe = repoPath.replace(/^\/+/, '');
-        if (isSkipped(safe)) { skipped++; continue; }
+        if (isHardSkipped(safe)) { skipped++; continue; }
+        if (isIgnored(safe)) {
+            // Zombie: el .syncignore lo prohíbe pero está en el NAS. Borrar.
+            try {
+                await deleteRemote(wsId, safe);
+                delete state[safe];
+                purged++;
+                verbose('  ✗', safe, '(purged by .syncignore)');
+            } catch (e) {
+                verbose('purge fail', safe, e.message);
+                skipped++;
+            }
+            continue;
+        }
         const local = localByPath.get(safe);
         const tracked = state[safe];
 
@@ -210,7 +277,8 @@ const syncOne = async (wsId) => {
     }
 
     for (const [repoPath, info] of localByPath) {
-        if (isSkipped(repoPath)) continue;
+        if (isHardSkipped(repoPath)) continue;
+        if (isIgnored(repoPath)) continue;
         const tracked = state[repoPath];
         const remote = remoteByPath.get(repoPath);
         if (remote && remote.contentHash === info.hash) { state[repoPath] = info.hash; continue; }
@@ -232,8 +300,8 @@ const syncOne = async (wsId) => {
     }
     await writeState(wsDir, state);
 
-    if (downloaded || uploaded || failed) {
-        log(`${wsId} → ↓${downloaded} ↑${uploaded}${created ? ` (${created} nuevos)` : ''} skip:${skipped} fail:${failed}`);
+    if (downloaded || uploaded || failed || purged) {
+        log(`${wsId} → ↓${downloaded} ↑${uploaded}${created ? ` (${created} nuevos)` : ''}${purged ? ` ✗${purged}` : ''} skip:${skipped} fail:${failed}`);
     } else {
         verbose(`${wsId} → al día`);
     }
