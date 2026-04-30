@@ -1,26 +1,12 @@
 #!/usr/bin/env node
 /**
- * agora-host-sync — daemon de sincronización en el HOST de los workers.
+ * agora-host-sync — daemon en el host del worker que mantiene el directorio
+ * `/home/stev/edu-worker/workspaces/<wsId>/` (montado como `/workspace` en el
+ * contenedor) espejado con la workspace en MinIO + Firestore.
  *
- * Bidireccional. Para cada contenedor `edu-worker-*` corriendo en el host,
- * el directorio local `/home/stev/edu-worker/workspaces/<wsId>/` (montado
- * como `/workspace` dentro del contenedor) se mantiene espejado contra la
- * workspace en MinIO+Firestore.
- *
- *   Pull:  GET /api/sync/worker-list  → manifest + signed URLs (5s poll)
- *   Push:  walk /workspace, detectar diffs, PUT a MinIO, POST commit
- *
- * Auth: HMAC con WORKER_SECRET (ver `src/lib/worker-auth.ts`).
- *
- * State: `<wsBase>/.agora-host-sync.json` con `{ <repoPath>: <hash> }`.
- *   - Si local hash != state ni remote → push (worker editó local).
- *   - Si remote hash != state ni local → pull (web editó remoto).
- *   - Si los 3 difieren → política simple: GANA REMOTO (server is source of truth).
- *
- * TODO (refactor pendiente confirmado por usuario):
- *   - "Control de precios" (pricing/usage): hoy mide en Firebase Storage; con
- *     el cambio a MinIO hay que recalcular cuotas leyendo del NAS, no del
- *     bucket Firebase. Ver lib/storage-usage.ts y dashboard de cuotas.
+ * Bidireccional. Pull cada 5s vía /api/sync/worker-list, push cuando detecta
+ * diffs locales. Auth HMAC con WORKER_SECRET. Conflicto a 3 vías → gana el
+ * server (source of truth).
  */
 import { spawn } from 'node:child_process';
 import { createHash, createHmac } from 'node:crypto';
@@ -32,7 +18,7 @@ const WORKER_SECRET = process.env.WORKER_SECRET;
 const BASE_DIR = process.env.BASE_DIR ?? '/home/stev/edu-worker/workspaces';
 const POLL_MS = Number.parseInt(process.env.POLL_MS ?? '5000', 10);
 const VERBOSE = process.env.VERBOSE === '1';
-// Patrones que NO se sincronizan en ninguna dirección (los maneja el entrypoint).
+// Archivos creados por el entrypoint o internos al daemon — no sincronizar.
 const SKIP_PREFIXES = ['.git/', 'repos/', '.agora-host-sync.json', '.syncignore', '.st-guide.md'];
 const SKIP_EXACT = new Set(['.git', 'repos', '.agora-host-sync.json', '.syncignore', '.st-guide.md']);
 
@@ -92,7 +78,6 @@ const isSkipped = (relPath) => {
     return SKIP_PREFIXES.some(p => relPath === p || relPath.startsWith(p));
 };
 
-/** Walk recursivo del workspace dir y devuelve mapa { repoPath → {buf, hash, size} }. */
 const walkLocal = async (wsDir) => {
     const out = new Map();
     const visit = async (dir, rel) => {
@@ -130,7 +115,6 @@ const guessContentType = (name) => {
     return 'application/octet-stream';
 };
 
-/** Sube un archivo local: signed PUT URL → /api/sync/worker-commit. */
 const pushFile = async (wsId, repoPath, info) => {
     const headers = { ...authHeaders(wsId), 'Content-Type': 'application/json' };
     const contentType = guessContentType(repoPath);
@@ -155,7 +139,6 @@ const syncOne = async (wsId) => {
     const wsDir = path.join(BASE_DIR, wsId);
     await mkdir(wsDir, { recursive: true });
 
-    // 1) PULL — manifest remoto.
     const data = await fetchJson(
         `${HUB_URL}/api/sync/worker-list?workspaceId=${encodeURIComponent(wsId)}`,
         { headers: authHeaders(wsId) }
@@ -163,30 +146,25 @@ const syncOne = async (wsId) => {
     if (!Array.isArray(data.items)) { log(wsId, 'respuesta inesperada'); return; }
     const remoteByPath = new Map(data.items.map(i => [i.repoPath, i]));
 
-    // 2) Walk local.
     const localByPath = await walkLocal(wsDir);
-
     const state = await readState(wsDir);
     let downloaded = 0, uploaded = 0, skipped = 0, failed = 0, created = 0;
 
-    // 3) PULL pass — remoto → local cuando difiere de state.
     for (const [repoPath, item] of remoteByPath) {
         const safe = repoPath.replace(/^\/+/, '');
         if (isSkipped(safe)) { skipped++; continue; }
         const local = localByPath.get(safe);
         const tracked = state[safe];
 
-        // Si el local hash == remoto, no hay nada que hacer.
         if (local && local.hash === item.contentHash) {
             state[safe] = item.contentHash;
             skipped++;
             continue;
         }
-        // Si local difiere del state pero remoto coincide con state → local cambió, push (lo hace fase 4).
+        // Local cambió pero remoto sigue igual → lo gestiona la fase de push.
         if (local && tracked && local.hash !== tracked && item.contentHash === tracked) {
             continue;
         }
-        // Resto: pull remoto.
         if (!item.signedUrl) { failed++; continue; }
         try {
             const buf = await fetchBuf(item.signedUrl);
@@ -203,13 +181,12 @@ const syncOne = async (wsId) => {
         }
     }
 
-    // 4) PUSH pass — local → remoto cuando difiere de state.
     for (const [repoPath, info] of localByPath) {
         if (isSkipped(repoPath)) continue;
         const tracked = state[repoPath];
         const remote = remoteByPath.get(repoPath);
         if (remote && remote.contentHash === info.hash) { state[repoPath] = info.hash; continue; }
-        if (tracked && tracked === info.hash) continue; // no cambió localmente
+        if (tracked && tracked === info.hash) continue;
         try {
             const result = await pushFile(wsId, repoPath, info);
             state[repoPath] = info.hash;
@@ -222,7 +199,6 @@ const syncOne = async (wsId) => {
         }
     }
 
-    // 5) Limpia entradas en state que ya no están en remoto NI local.
     for (const k of Object.keys(state)) {
         if (!remoteByPath.has(k) && !localByPath.has(k)) delete state[k];
     }
@@ -236,7 +212,7 @@ const syncOne = async (wsId) => {
 };
 
 const main = async () => {
-    log(`agora-host-sync v2 (bidireccional) Hub=${HUB_URL} POLL=${POLL_MS}ms`);
+    log(`agora-host-sync iniciado. Hub=${HUB_URL} POLL=${POLL_MS}ms`);
     while (true) {
         try {
             const tokens = await listWorkers();
