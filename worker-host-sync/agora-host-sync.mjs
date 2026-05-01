@@ -65,18 +65,24 @@ if (!WORKER_SECRET) {
 const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
 const verbose = (...a) => { if (VERBOSE) log(...a); };
 
-const sign = (workspaceId, ts) =>
-    createHmac('sha256', WORKER_SECRET).update(`${workspaceId}:${ts}`).digest('hex');
+const sign = (workspaceId, ts, userId) =>
+    createHmac('sha256', WORKER_SECRET)
+        .update(`${workspaceId}:${ts}${userId ? `:${userId}` : ''}`)
+        .digest('hex');
 
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');
 
-const authHeaders = (wsId) => {
+const authHeaders = (wsId, userId = null) => {
     const ts = Date.now();
-    return {
+    let uid = userId;
+    if (!uid && wsId.startsWith('personal:')) uid = wsId.slice('personal:'.length);
+    const headers = {
         'X-Worker-Token': wsId,
         'X-Worker-Ts': String(ts),
-        'X-Worker-Sig': sign(wsId, ts)
+        'X-Worker-Sig': sign(wsId, ts, uid)
     };
+    if (uid) headers['X-Worker-Uid'] = uid;
+    return headers;
 };
 
 const fetchJson = async (url, init = {}) => {
