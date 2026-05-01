@@ -167,6 +167,12 @@ const readSyncignore = async (wsDir) => {
     return [...BUILTIN_IGNORE_RULES, ...userRules];
 };
 
+// Caché de hashes por (path, mtimeMs, size). Si nada cambia (mtime ni size),
+// reutilizamos el hash del último cómputo en vez de leer 22+ MB cada ciclo.
+// Crítico para evitar el "ghost-push" de PDFs grandes: readFile() ocasionalmente
+// devolvía buffers con sha256 inestable, dando localChanged=true sin razón.
+const hashCache = new Map();
+
 const walkLocal = async (wsDir) => {
     const out = new Map();
     const visit = async (dir, rel) => {
@@ -181,8 +187,18 @@ const walkLocal = async (wsDir) => {
                 await visit(fullPath, relPath);
             } else if (e.isFile()) {
                 try {
+                    const st = await stat(fullPath);
+                    const cacheKey = `${fullPath}`;
+                    const cached = hashCache.get(cacheKey);
+                    if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+                        // mtime y size idénticos → reusa hash y referencia diferida al buf.
+                        out.set(relPath, { hash: cached.hash, size: st.size, getBuf: () => readFile(fullPath) });
+                        continue;
+                    }
                     const buf = await readFile(fullPath);
-                    out.set(relPath, { buf, hash: sha256(buf), size: buf.length });
+                    const hash = sha256(buf);
+                    hashCache.set(cacheKey, { mtimeMs: st.mtimeMs, size: buf.length, hash });
+                    out.set(relPath, { buf, hash, size: buf.length, getBuf: async () => buf });
                 } catch (err) {
                     verbose('walkLocal read fail', relPath, err.message);
                 }
@@ -219,10 +235,12 @@ const pushFile = async (wsId, repoPath, info) => {
         method: 'POST', headers,
         body: JSON.stringify({ repoPath, contentType })
     });
+    const buf = info.buf ?? (info.getBuf ? await info.getBuf() : null);
+    if (!buf) throw new Error('no buffer');
     const putRes = await fetch(upload.signedUrl, {
         method: 'PUT',
         headers: { 'Content-Type': contentType },
-        body: info.buf
+        body: buf
     });
     if (!putRes.ok) throw new Error(`MinIO PUT HTTP ${putRes.status}`);
     const commit = await fetchJson(`${HUB_URL}/api/sync/worker-commit`, {
