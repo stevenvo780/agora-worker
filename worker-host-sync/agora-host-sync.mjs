@@ -9,53 +9,17 @@
  * server (source of truth).
  */
 import { spawn } from 'node:child_process';
-import { createHash, createHmac } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { mkdir, writeFile, readFile, stat, readdir, rm } from 'node:fs/promises';
 import path from 'node:path';
+import { compileIgnore, isHardSkipped, isWorkspacePathIgnored, BUILTIN_IGNORE_RULES } from './ignore.mjs';
+import { buildAuthHeaders } from './auth.mjs';
 
 const HUB_URL = process.env.AGORA_HUB_URL ?? 'https://agora.elenxos.com';
 const WORKER_SECRET = process.env.WORKER_SECRET;
 const BASE_DIR = process.env.BASE_DIR ?? '/home/stev/edu-worker/workspaces';
 const POLL_MS = Number.parseInt(process.env.POLL_MS ?? '5000', 10);
 const VERBOSE = process.env.VERBOSE === '1';
-// Internos al daemon o al runtime del worker — nunca tocar (en ambas direcciones).
-// `.syncignore` y `.gitignore` SÍ se sincronizan: el user los edita desde la web.
-const HARD_SKIP = ['.git/', 'repos/', '.agora-host-sync.json', '.st-guide.md'];
-
-// Reglas intrínsecas que se aplican aunque el `.syncignore` del workspace no
-// las liste. Cubren archivos temporales de editores que NUNCA deben llegar
-// al NAS (vim swap, lockfiles de LibreOffice, etc.). Siempre activas.
-const BUILTIN_IGNORE_TEXT = [
-    '*.swp', '*.swo', '*.swn',
-    '*~',
-    '.~lock.*', '.#*',
-    '.DS_Store', 'Thumbs.db', 'desktop.ini'
-].join('\n');
-
-const compileIgnore = (txt) => {
-    const lines = txt.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
-    return lines.map(line => {
-        const negate = line.startsWith('!');
-        const raw = negate ? line.slice(1) : line;
-        const dirOnly = raw.endsWith('/');
-        const pat = dirOnly ? raw.slice(0, -1) : raw;
-        const escaped = pat.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]');
-        return { negate, dirOnly, regex: new RegExp(`(^|/)${escaped}(/|$)`) };
-    });
-};
-
-const matchIgnore = (rules, path) => {
-    let matched = false;
-    for (const r of rules) {
-        if (r.regex.test(path)) matched = !r.negate;
-    }
-    return matched;
-};
-
-const isHardSkipped = (relPath) => {
-    if (!relPath) return false;
-    return HARD_SKIP.some(p => relPath === p.replace(/\/$/, '') || relPath === p || relPath.startsWith(p));
-};
 
 if (!WORKER_SECRET) {
     console.error('agora-host-sync: WORKER_SECRET requerido');
@@ -65,25 +29,8 @@ if (!WORKER_SECRET) {
 const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
 const verbose = (...a) => { if (VERBOSE) log(...a); };
 
-const sign = (workspaceId, ts, userId) =>
-    createHmac('sha256', WORKER_SECRET)
-        .update(`${workspaceId}:${ts}${userId ? `:${userId}` : ''}`)
-        .digest('hex');
-
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');
-
-const authHeaders = (wsId, userId = null) => {
-    const ts = Date.now();
-    let uid = userId;
-    if (!uid && wsId.startsWith('personal:')) uid = wsId.slice('personal:'.length);
-    const headers = {
-        'X-Worker-Token': wsId,
-        'X-Worker-Ts': String(ts),
-        'X-Worker-Sig': sign(wsId, ts, uid)
-    };
-    if (uid) headers['X-Worker-Uid'] = uid;
-    return headers;
-};
+const authHeaders = (wsId, userId = null) => buildAuthHeaders(WORKER_SECRET, wsId, userId);
 
 const fetchJson = async (url, init = {}) => {
     const r = await fetch(url, init);
@@ -141,8 +88,6 @@ const readState = async (wsDir) => {
 };
 const writeState = async (wsDir, state) =>
     writeFile(path.join(wsDir, '.agora-host-sync.json'), JSON.stringify(state, null, 2));
-
-const BUILTIN_IGNORE_RULES = compileIgnore(BUILTIN_IGNORE_TEXT);
 
 // Circuit breaker: tras N fallos consecutivos del mismo path o workspace,
 // dejar de intentar y solo loggear cada 30 ciclos. Evita inundar el log con
@@ -272,7 +217,7 @@ const syncOne = async (wsId) => {
     // .syncignore se aplica DESPUÉS del walk para que el archivo `.syncignore`
     // mismo se sincronice (jamás se ignora a sí mismo).
     const ignoreRules = await readSyncignore(wsDir);
-    const isIgnored = (relPath) => relPath !== '.syncignore' && relPath !== '.gitignore' && matchIgnore(ignoreRules, relPath);
+    const isIgnored = (relPath) => isWorkspacePathIgnored(ignoreRules, relPath);
 
     let downloaded = 0, uploaded = 0, skipped = 0, failed = 0, created = 0, purged = 0;
     let deletedLocal = 0, deletedRemote = 0;
