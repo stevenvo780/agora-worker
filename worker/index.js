@@ -5,6 +5,8 @@
  */
 
 import fs from 'fs';
+import path from 'path';
+import { exec } from 'child_process';
 import { io } from 'socket.io-client';
 import pty from 'node-pty';
 import crypto from 'crypto';
@@ -143,6 +145,8 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 const DEFAULT_WORKDIR = '/workspace';
+const MAX_AGENT_COMMAND_LENGTH = 4000;
+const MAX_AGENT_OUTPUT_BYTES = 20000;
 
 if (!fs.existsSync(DEFAULT_WORKDIR)) {
     try {
@@ -151,6 +155,97 @@ if (!fs.existsSync(DEFAULT_WORKDIR)) {
         console.error('Failed to create workspace:', e);
     }
 }
+
+function resolveAgentCwd(rawCwd = '.') {
+    const base = path.resolve(DEFAULT_WORKDIR);
+    const target = path.resolve(base, String(rawCwd || '.'));
+    if (target !== base && !target.startsWith(`${base}${path.sep}`)) {
+        throw new Error('cwd fuera de /workspace');
+    }
+    return target;
+}
+
+function validateAgentCommand(command) {
+    if (!command || !String(command).trim()) throw new Error('command required');
+    if (String(command).length > MAX_AGENT_COMMAND_LENGTH) throw new Error('command too long');
+    if (String(command).includes('\0')) throw new Error('command contains null bytes');
+    if (/\bsudo\b|\bsu\s+-?|\bpasswd\b/.test(command)) {
+        throw new Error('privileged commands are not allowed');
+    }
+    if (/\b(mkfs|fdisk|parted|mount|umount|shutdown|reboot|poweroff)\b/.test(command)) {
+        throw new Error('system commands are not allowed');
+    }
+    if (/\brm\s+(-[^\n;|&]*[rR][^\n;|&]*[fF]|-[^\n;|&]*[fF][^\n;|&]*[rR])\s+(\/|\/\*|~|\$HOME)(\s|$)/.test(command)) {
+        throw new Error('dangerous root/home removal is not allowed');
+    }
+}
+
+socket.on('agent-command', (payload = {}) => {
+    const startedAt = Date.now();
+    const {
+        requestId,
+        workspaceId,
+        command,
+        cwd = '.'
+    } = payload;
+
+    const timeoutMs = Math.min(Math.max(Number(payload.timeoutMs || 15000), 1000), 25000);
+    const maxOutputBytes = Math.min(Math.max(Number(payload.maxOutputBytes || 12000), 1000), MAX_AGENT_OUTPUT_BYTES);
+
+    const reply = (result) => {
+        socket.emit('agent-command-result', {
+            requestId,
+            workspaceId: tokenInfo.workspaceId,
+            command: String(command || ''),
+            cwd: String(cwd || '.'),
+            durationMs: Date.now() - startedAt,
+            ...result
+        });
+    };
+
+    try {
+        if (!requestId) throw new Error('requestId required');
+        if (workspaceId && workspaceId !== tokenInfo.workspaceId) {
+            throw new Error(`workspace mismatch: ${workspaceId}`);
+        }
+        validateAgentCommand(String(command || ''));
+        const resolvedCwd = resolveAgentCwd(cwd);
+
+        exec(String(command), {
+            cwd: resolvedCwd,
+            shell: '/bin/bash',
+            timeout: timeoutMs,
+            maxBuffer: maxOutputBytes * 2,
+            env: {
+                ...process.env,
+                TERM: 'xterm-256color',
+                FORCE_COLOR: '1'
+            }
+        }, (error, stdout, stderr) => {
+            const err = error && typeof error === 'object' ? error : null;
+            const exitCode = err && 'code' in err && typeof err.code === 'number' ? err.code : 0;
+            const signal = err && 'signal' in err && typeof err.signal === 'string' ? err.signal : null;
+            const timedOut = err && 'killed' in err && err.killed === true && signal === 'SIGTERM';
+            reply({
+                ok: !error,
+                stdout: String(stdout || '').slice(0, maxOutputBytes),
+                stderr: String(stderr || (error?.message || '')).slice(0, maxOutputBytes),
+                exitCode,
+                signal,
+                timedOut
+            });
+        });
+    } catch (error) {
+        reply({
+            ok: false,
+            stdout: '',
+            stderr: error instanceof Error ? error.message : String(error),
+            exitCode: null,
+            signal: null,
+            timedOut: false
+        });
+    }
+});
 
 socket.on('session-created', (data = {}) => {
     const { id: sessionId, workspaceId, workspaceName } = data;
