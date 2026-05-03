@@ -165,18 +165,62 @@ function resolveAgentCwd(rawCwd = '.') {
     return target;
 }
 
+// Whitelist de binarios seguros — solo el primer token de cada segmento de
+// la cadena (separado por |, &&, ||, ;) puede invocar uno de estos. Cualquier
+// comando fuera del set se rechaza. Es más restrictivo que la blacklist
+// previa y previene evasiones tipo `s\\udo` o `bash -c "..."`.
+const ALLOWED_AGENT_BINARIES = new Set([
+    'ls', 'pwd', 'cat', 'echo', 'head', 'tail', 'wc', 'grep', 'find', 'sort', 'uniq',
+    'cut', 'awk', 'sed', 'tr', 'tee', 'diff', 'stat', 'file', 'date',
+    'mkdir', 'touch', 'cp', 'mv', 'rm', 'ln',
+    'git',
+    'node', 'npm', 'pnpm', 'npx', 'yarn',
+    'python', 'python3', 'pip', 'pip3',
+    'curl', 'wget',
+    'tree', 'jq', 'tsc', 'eslint', 'prettier',
+    'true', 'false'
+]);
+
+const ALWAYS_FORBIDDEN_RE = /\b(sudo|su|passwd|mkfs|fdisk|parted|mount|umount|shutdown|reboot|poweroff|chown|chmod\s+[+]?[rwx]*[s])\b/;
+
+function tokenize(segment) {
+    return String(segment || '').trim().split(/\s+/).filter(Boolean);
+}
+
 function validateAgentCommand(command) {
-    if (!command || !String(command).trim()) throw new Error('command required');
-    if (String(command).length > MAX_AGENT_COMMAND_LENGTH) throw new Error('command too long');
-    if (String(command).includes('\0')) throw new Error('command contains null bytes');
-    if (/\bsudo\b|\bsu\s+-?|\bpasswd\b/.test(command)) {
-        throw new Error('privileged commands are not allowed');
+    const cmd = String(command || '');
+    if (!cmd.trim()) throw new Error('command required');
+    if (cmd.length > MAX_AGENT_COMMAND_LENGTH) throw new Error('command too long');
+    if (cmd.includes('\0')) throw new Error('command contains null bytes');
+    if (ALWAYS_FORBIDDEN_RE.test(cmd)) {
+        throw new Error('privileged or destructive system commands are not allowed');
     }
-    if (/\b(mkfs|fdisk|parted|mount|umount|shutdown|reboot|poweroff)\b/.test(command)) {
-        throw new Error('system commands are not allowed');
-    }
-    if (/\brm\s+(-[^\n;|&]*[rR][^\n;|&]*[fF]|-[^\n;|&]*[fF][^\n;|&]*[rR])\s+(\/|\/\*|~|\$HOME)(\s|$)/.test(command)) {
-        throw new Error('dangerous root/home removal is not allowed');
+
+    // Partir por separadores shell (|, &&, ||, ;) — cada segmento debe empezar
+    // con un binario whitelisted.
+    const segments = cmd.split(/(?:\|\||&&|;|\|)/).map((s) => s.trim()).filter(Boolean);
+    if (segments.length === 0) throw new Error('command required');
+
+    for (const seg of segments) {
+        const tokens = tokenize(seg);
+        const head = tokens[0];
+        if (!head) continue;
+        // Aceptar `VAR=value cmd ...`
+        const realHead = /^[A-Z_][A-Z0-9_]*=/.test(head) ? tokens[1] : head;
+        if (!realHead) throw new Error(`empty segment: ${seg}`);
+        const binary = realHead.split('/').pop();
+        if (!binary || !ALLOWED_AGENT_BINARIES.has(binary)) {
+            throw new Error(`binary "${binary}" no está en la whitelist del agente`);
+        }
+        // rm requiere args explícitos, nunca / ni ~
+        if (binary === 'rm') {
+            if (tokens.some((t) => t === '/' || t === '~' || t === '$HOME' || t === '/*')) {
+                throw new Error('rm sobre root/home está bloqueado');
+            }
+            if (!tokens.some((t) => t.startsWith('-'))) {
+                // ok: rm filename simple
+            }
+        }
     }
 }
 
