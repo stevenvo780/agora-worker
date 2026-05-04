@@ -138,6 +138,8 @@ RUN cd /opt/agora-cli && npm install --omit=dev --no-audit --no-fund && npm link
 
 # Copy application code
 COPY index.js .
+COPY agent-command-policy.mjs .
+COPY worker-token.mjs .
 COPY entrypoint.sh .
 
 # Clean up any stale serviceAccountKey.json directory from cache
