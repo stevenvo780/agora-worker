@@ -9,7 +9,8 @@ import path from 'path';
 import { exec } from 'child_process';
 import { io } from 'socket.io-client';
 import pty from 'node-pty';
-import crypto from 'crypto';
+import { validateAgentCommand } from './agent-command-policy.mjs';
+import { generateSignedToken, parseToken } from './worker-token.mjs';
 
 const NEXUS_URL = process.env.NEXUS_URL || 'http://localhost:3010';
 
@@ -18,32 +19,12 @@ const NEXUS_URL = process.env.NEXUS_URL || 'http://localhost:3010';
  * WORKER_TOKEN is treated as the Workspace Identifier (Identity).
  */
 const WORKER_ID = process.env.WORKER_TOKEN || '';
-const WORKER_SECRET = process.env.WORKER_SECRET || '';
+const WORKER_SECRET = process.env.WORKER_SOCKET_SECRET || process.env.WORKER_SECRET || '';
 const SAFE_WORKSPACE_ID = /^[a-zA-Z0-9_:-]+$/;
 
 if (WORKER_ID && !SAFE_WORKSPACE_ID.test(WORKER_ID)) {
   console.error('❌ WORKER_TOKEN (ID) contains invalid characters.');
   process.exit(1);
-}
-
-/**
- * Parses the worker token to determine workspace ID, type, and associated user.
- * @param {string} token - The raw worker token.
- * @returns {Object} Parsed token information.
- */
-function parseToken(token) {
-  if (token.startsWith('personal:')) {
-    return {
-      workspaceId: token,
-      workspaceType: 'personal',
-      userId: token.substring('personal:'.length)
-    };
-  }
-  return {
-    workspaceId: token,
-    workspaceType: 'shared',
-    userId: null
-  };
 }
 
 const tokenInfo = parseToken(WORKER_ID);
@@ -59,27 +40,8 @@ if (!WORKER_ID) {
 }
 
 if (!WORKER_SECRET) {
-  console.error('❌ WORKER_SECRET is required for signing authentication tokens.');
+  console.error('❌ WORKER_SOCKET_SECRET or WORKER_SECRET is required for signing authentication tokens.');
   process.exit(1);
-}
-
-/**
- * Generates a signed HMAC token for authentication with the Hub.
- * @param {string} id - The workspace ID.
- * @param {string} secret - The worker secret key.
- * @returns {string} Base64 encoded payload and signature.
- */
-function generateSignedToken(id, secret) {
-  const info = parseToken(id);
-  const payload = JSON.stringify({
-    workspaceId: info.workspaceId,
-    workspaceType: info.workspaceType,
-    ownerId: info.userId,
-    timestamp: Date.now()
-  });
-  const payloadB64 = Buffer.from(payload).toString('base64');
-  const signature = crypto.createHmac('sha256', secret).update(payloadB64).digest('hex');
-  return `${payloadB64}.${signature}`;
 }
 
 // Note: DO NOT generate signedToken here — it expires after 5 minutes.
@@ -126,6 +88,25 @@ const sessions = new Map();
 const SESSION_LAST_ACTIVITY = new Map();
 const MAX_SESSIONS = 50;
 const SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 min
+const HEARTBEAT_MS = 10 * 1000;
+const workerMetrics = {
+    lastOperationAt: null,
+    consecutiveErrors: 0
+};
+
+const emitHeartbeat = () => {
+    socket.emit('worker-heartbeat', {
+        workspaceId: tokenInfo.workspaceId,
+        activeSessions: sessions.size,
+        syncLagMs: null,
+        lastOperationAt: workerMetrics.lastOperationAt,
+        consecutiveErrors: workerMetrics.consecutiveErrors,
+        version: process.env.npm_package_version || 'unknown'
+    });
+};
+
+socket.on('connect', emitHeartbeat);
+setInterval(emitHeartbeat, HEARTBEAT_MS);
 
 // Kill sessions that have been idle for more than 30 minutes
 setInterval(() => {
@@ -165,65 +146,6 @@ function resolveAgentCwd(rawCwd = '.') {
     return target;
 }
 
-// Whitelist de binarios seguros — solo el primer token de cada segmento de
-// la cadena (separado por |, &&, ||, ;) puede invocar uno de estos. Cualquier
-// comando fuera del set se rechaza. Es más restrictivo que la blacklist
-// previa y previene evasiones tipo `s\\udo` o `bash -c "..."`.
-const ALLOWED_AGENT_BINARIES = new Set([
-    'ls', 'pwd', 'cat', 'echo', 'head', 'tail', 'wc', 'grep', 'find', 'sort', 'uniq',
-    'cut', 'awk', 'sed', 'tr', 'tee', 'diff', 'stat', 'file', 'date',
-    'mkdir', 'touch', 'cp', 'mv', 'rm', 'ln',
-    'git',
-    'node', 'npm', 'pnpm', 'npx', 'yarn',
-    'python', 'python3', 'pip', 'pip3',
-    'curl', 'wget',
-    'tree', 'jq', 'tsc', 'eslint', 'prettier',
-    'true', 'false'
-]);
-
-const ALWAYS_FORBIDDEN_RE = /\b(sudo|su|passwd|mkfs|fdisk|parted|mount|umount|shutdown|reboot|poweroff|chown|chmod\s+[+]?[rwx]*[s])\b/;
-
-function tokenize(segment) {
-    return String(segment || '').trim().split(/\s+/).filter(Boolean);
-}
-
-function validateAgentCommand(command) {
-    const cmd = String(command || '');
-    if (!cmd.trim()) throw new Error('command required');
-    if (cmd.length > MAX_AGENT_COMMAND_LENGTH) throw new Error('command too long');
-    if (cmd.includes('\0')) throw new Error('command contains null bytes');
-    if (ALWAYS_FORBIDDEN_RE.test(cmd)) {
-        throw new Error('privileged or destructive system commands are not allowed');
-    }
-
-    // Partir por separadores shell (|, &&, ||, ;) — cada segmento debe empezar
-    // con un binario whitelisted.
-    const segments = cmd.split(/(?:\|\||&&|;|\|)/).map((s) => s.trim()).filter(Boolean);
-    if (segments.length === 0) throw new Error('command required');
-
-    for (const seg of segments) {
-        const tokens = tokenize(seg);
-        const head = tokens[0];
-        if (!head) continue;
-        // Aceptar `VAR=value cmd ...`
-        const realHead = /^[A-Z_][A-Z0-9_]*=/.test(head) ? tokens[1] : head;
-        if (!realHead) throw new Error(`empty segment: ${seg}`);
-        const binary = realHead.split('/').pop();
-        if (!binary || !ALLOWED_AGENT_BINARIES.has(binary)) {
-            throw new Error(`binary "${binary}" no está en la whitelist del agente`);
-        }
-        // rm requiere args explícitos, nunca / ni ~
-        if (binary === 'rm') {
-            if (tokens.some((t) => t === '/' || t === '~' || t === '$HOME' || t === '/*')) {
-                throw new Error('rm sobre root/home está bloqueado');
-            }
-            if (!tokens.some((t) => t.startsWith('-'))) {
-                // ok: rm filename simple
-            }
-        }
-    }
-}
-
 socket.on('agent-command', (payload = {}) => {
     const startedAt = Date.now();
     const {
@@ -252,7 +174,7 @@ socket.on('agent-command', (payload = {}) => {
         if (workspaceId && workspaceId !== tokenInfo.workspaceId) {
             throw new Error(`workspace mismatch: ${workspaceId}`);
         }
-        validateAgentCommand(String(command || ''));
+        validateAgentCommand(String(command || ''), { maxLength: MAX_AGENT_COMMAND_LENGTH });
         const resolvedCwd = resolveAgentCwd(cwd);
 
         exec(String(command), {
@@ -266,6 +188,8 @@ socket.on('agent-command', (payload = {}) => {
                 FORCE_COLOR: '1'
             }
         }, (error, stdout, stderr) => {
+            workerMetrics.lastOperationAt = Date.now();
+            workerMetrics.consecutiveErrors = error ? workerMetrics.consecutiveErrors + 1 : 0;
             const err = error && typeof error === 'object' ? error : null;
             const exitCode = err && 'code' in err && typeof err.code === 'number' ? err.code : 0;
             const signal = err && 'signal' in err && typeof err.signal === 'string' ? err.signal : null;
@@ -280,6 +204,8 @@ socket.on('agent-command', (payload = {}) => {
             });
         });
     } catch (error) {
+        workerMetrics.lastOperationAt = Date.now();
+        workerMetrics.consecutiveErrors++;
         reply({
             ok: false,
             stdout: '',

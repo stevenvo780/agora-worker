@@ -5,8 +5,8 @@
  * contenedor) espejado con la workspace en MinIO + Firestore.
  *
  * Bidireccional. Pull cada 5s vía /api/sync/worker-list, push cuando detecta
- * diffs locales. Auth HMAC con WORKER_SECRET. Conflicto a 3 vías → gana el
- * server (source of truth).
+ * diffs locales. Auth HMAC con WORKER_SYNC_SECRET (`WORKER_SECRET` queda como
+ * fallback legacy). Conflicto a 3 vías → gana el server (source of truth).
  */
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -15,14 +15,14 @@ import path from 'node:path';
 import { compileIgnore, isHardSkipped, isWorkspacePathIgnored, BUILTIN_IGNORE_RULES } from './ignore.mjs';
 import { buildAuthHeaders } from './auth.mjs';
 
-const HUB_URL = process.env.AGORA_HUB_URL ?? 'https://agora.elenxos.com';
-const WORKER_SECRET = process.env.WORKER_SECRET;
+const HUB_URL = process.env.AGORA_HUB_URL ?? 'https://agora-backend-578238159459.us-central1.run.app';
+const WORKER_SECRET = process.env.WORKER_SYNC_SECRET || process.env.WORKER_SECRET;
 const BASE_DIR = process.env.BASE_DIR ?? '/home/stev/edu-worker/workspaces';
 const POLL_MS = Number.parseInt(process.env.POLL_MS ?? '5000', 10);
 const VERBOSE = process.env.VERBOSE === '1';
 
 if (!WORKER_SECRET) {
-    console.error('agora-host-sync: WORKER_SECRET requerido');
+    console.error('agora-host-sync: WORKER_SYNC_SECRET o WORKER_SECRET requerido');
     process.exit(1);
 }
 

@@ -1,5 +1,5 @@
 {
-  "name": "@agora/cli",
+  "name": "@agora/worker-cli",
   "version": "0.1.0",
   "description": "CLI para clonar, sincronizar y trabajar workspaces de Agora desde tu Linux/Mac/Windows con cualquier editor (VS Code, etc.).",
   "private": false,

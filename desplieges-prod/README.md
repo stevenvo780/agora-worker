@@ -79,7 +79,8 @@ ALLOW_INPLACE_ST_UPDATE=1 ./desplieges-prod/update_st_workers.sh 3.2.1
 - Archivo: `/etc/edu-worker/worker.env`
 - Variables mínimas:
   - `NEXUS_URL=https://hub.humanizar-dev.cloud`
-  - `WORKER_SECRET` (debe coincidir con el hub)
+  - `WORKER_SOCKET_SECRET` (debe coincidir con Hub)
+  - `WORKER_SYNC_SECRET` (debe coincidir con AgoraBack/host-sync)
   - `FIREBASE_CONFIG` con `projectId`, `storageBucket`, `databaseURL`
 
 ### Hub
@@ -91,8 +92,8 @@ ALLOW_INPLACE_ST_UPDATE=1 ./desplieges-prod/update_st_workers.sh 3.2.1
 Regla obligatoria:
 
 ```bash
-grep -E 'WORKER_SECRET' /home/stev/edu-hub/.env
-grep -E 'NEXUS_URL|WORKER_SECRET' /etc/edu-worker/worker.env
+grep -E 'WORKER_SOCKET_SECRET|WORKER_SECRET_PREVIOUS|WORKER_SECRET' /home/stev/edu-hub/.env
+grep -E 'NEXUS_URL|WORKER_SOCKET_SECRET|WORKER_SYNC_SECRET|WORKER_SECRET_PREVIOUS|WORKER_SECRET' /etc/edu-worker/worker.env
 ```
 
 ---
@@ -114,7 +115,7 @@ sudo docker exec $(sudo docker ps --filter name=edu-worker --format '{{.Names}}'
 | Síntoma | Revisar |
 |---|---|
 | Timeout al hub | `NEXUS_URL` en `/etc/edu-worker/worker.env` |
-| Auth failure | `WORKER_SECRET` en hub y worker |
+| Auth failure | `WORKER_SOCKET_SECRET` para Hub o `WORKER_SYNC_SECRET` para Back/host-sync |
 | Worker no reaparece | `sudo edu-worker-manager update all` + logs |
 | ST sigue viejo | reconstruir imagen y no solo hotfix interno |
 

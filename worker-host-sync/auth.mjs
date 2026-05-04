@@ -1,6 +1,6 @@
 /**
  * HMAC auth para agora-host-sync. Match exacto de
- * src/lib/worker-auth.ts del Hub: si esto se desfasa, los workers
+ * src/lib/worker-auth.ts de AgoraBack: si esto se desfasa, los workers
  * empiezan a recibir 401 en silencio.
  */
 import { createHmac } from 'node:crypto';
@@ -10,8 +10,8 @@ export const sign = (workerSecret, workspaceId, ts, userId) =>
         .update(`${workspaceId}:${ts}${userId ? `:${userId}` : ''}`)
         .digest('hex');
 
-export const buildAuthHeaders = (workerSecret, wsId, userId = null) => {
-    const ts = Date.now();
+export const buildAuthHeaders = (workerSecret, wsId, userId = null, now = Date.now()) => {
+    const ts = now;
     let uid = userId;
     if (!uid && wsId.startsWith('personal:')) uid = wsId.slice('personal:'.length);
     const headers = {

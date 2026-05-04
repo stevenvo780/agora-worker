@@ -22,6 +22,7 @@ sudo mkdir -p /etc/systemd/system/agora-host-sync.service.d
 sudo tee /etc/systemd/system/agora-host-sync.service.d/secret.conf > /dev/null <<EOF
 [Service]
 Environment=WORKER_SECRET=<el WORKER_SECRET compartido del host>
+Environment=WORKER_SYNC_SECRET=<el secreto dedicado de sync HTTP>
 EOF
 sudo systemctl daemon-reload
 sudo systemctl enable --now agora-host-sync
@@ -38,6 +39,8 @@ sudo systemctl enable --now agora-host-sync
 
 Variables de entorno opcionales:
 - `AGORA_HUB_URL` — default `https://agora.elenxos.com`
+- `WORKER_SYNC_SECRET` — secreto dedicado para HMAC contra AgoraBack.
+- `WORKER_SECRET` — fallback legacy durante rotación.
 - `BASE_DIR` — default `/home/stev/edu-worker/workspaces`
 - `POLL_MS` — default `5000`
 - `VERBOSE=1` — logs detallados por archivo

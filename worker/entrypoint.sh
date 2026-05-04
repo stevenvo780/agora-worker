@@ -2,7 +2,7 @@
 set -e
 
 # Sync Agent Authentication:
-# - Worker connects to Hub with signed HMAC token (WORKER_SECRET)
+# - Worker connects to Hub with signed HMAC token (WORKER_SOCKET_SECRET, or WORKER_SECRET fallback)
 # - Hub verifies and issues Firebase Custom Token
 # - No serviceAccountKey.json needed in workers (secure architecture)
 

@@ -7,7 +7,8 @@ Wants=docker.service network-online.target
 Type=simple
 User=stev
 Group=stev
-# WORKER_SECRET se inyecta vía drop-in en /etc/systemd/system/agora-host-sync.service.d/
+# WORKER_SYNC_SECRET se inyecta vía drop-in en /etc/systemd/system/agora-host-sync.service.d/
+# WORKER_SECRET sigue soportado como fallback legacy.
 EnvironmentFile=-/etc/edu-worker/worker.env
 ExecStart=/usr/bin/node /home/stev/bin/agora-host-sync.mjs
 Restart=always
