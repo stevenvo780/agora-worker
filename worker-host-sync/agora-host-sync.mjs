@@ -7,19 +7,31 @@
  * Bidireccional. Pull cada 5s vía /api/sync/worker-list, push cuando detecta
  * diffs locales. Auth HMAC con WORKER_SYNC_SECRET (`WORKER_SECRET` queda como
  * fallback legacy). Conflicto a 3 vías → gana el server (source of truth).
+ *
+ * Métricas:
+ *  - logs JSON por ciclo (stdout + journal)
+ *  - endpoint Prometheus en :9090/metrics (loopback)
  */
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdir, writeFile, readFile, stat, readdir, rm } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import path from 'node:path';
 import { compileIgnore, isHardSkipped, isWorkspacePathIgnored, BUILTIN_IGNORE_RULES } from './ignore.mjs';
 import { buildAuthHeaders } from './auth.mjs';
+import { runPool } from './pool.mjs';
+import { MetricsRegistry, percentile } from './metrics.mjs';
 
 const HUB_URL = process.env.AGORA_HUB_URL ?? 'https://agora-backend-578238159459.us-central1.run.app';
 const WORKER_SECRET = process.env.WORKER_SYNC_SECRET || process.env.WORKER_SECRET;
 const BASE_DIR = process.env.BASE_DIR ?? '/home/stev/edu-worker/workspaces';
 const POLL_MS = Number.parseInt(process.env.POLL_MS ?? '5000', 10);
 const VERBOSE = process.env.VERBOSE === '1';
+const CONCURRENCY = Number.parseInt(process.env.CONCURRENCY ?? '4', 10);
+const SYNC_CONCURRENCY = Number.parseInt(process.env.SYNC_CONCURRENCY ?? '8', 10);
+const METRICS_PORT = Number.parseInt(process.env.METRICS_PORT ?? '9090', 10);
+const METRICS_BIND = process.env.METRICS_BIND ?? '127.0.0.1';
+const METRICS_DISABLED = process.env.METRICS_DISABLED === '1';
 
 if (!WORKER_SECRET) {
     console.error('agora-host-sync: WORKER_SYNC_SECRET o WORKER_SECRET requerido');
@@ -31,6 +43,67 @@ const verbose = (...a) => { if (VERBOSE) log(...a); };
 
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');
 const authHeaders = (wsId, userId = null) => buildAuthHeaders(WORKER_SECRET, wsId, userId);
+
+// ── Métricas ────────────────────────────────────────────────────────────────
+
+const registry = new MetricsRegistry();
+const filesProcessed = registry.counter(
+    'agora_sync_files_processed_total',
+    'Archivos procesados por agora-host-sync (op,result)'
+);
+const bytesTransferred = registry.counter(
+    'agora_sync_bytes_total',
+    'Bytes transferidos (direction=up|down)'
+);
+const opDuration = registry.histogram(
+    'agora_sync_op_duration_ms',
+    'Latencia por operación de sync en ms',
+    [10, 50, 100, 250, 500, 1000, 2500, 5000]
+);
+const queueDepth = registry.gauge(
+    'agora_sync_queue_depth',
+    'Operaciones planificadas en el último ciclo por workspace'
+);
+const lastCycleTs = registry.gauge(
+    'agora_sync_last_cycle_unixtime',
+    'Unix timestamp del último ciclo completo por workspace'
+);
+const lastCycleDuration = registry.gauge(
+    'agora_sync_last_cycle_duration_ms',
+    'Duración del último ciclo por workspace en ms'
+);
+const workersActive = registry.gauge(
+    'agora_sync_workers_active',
+    'Workers detectados por docker ps en el último ciclo'
+);
+const cyclesTotal = registry.counter(
+    'agora_sync_cycles_total',
+    'Ciclos completados (con éxito o fallo)'
+);
+
+const startMetricsServer = () => {
+    if (METRICS_DISABLED) return;
+    const server = createServer((req, res) => {
+        if (req.url === '/metrics') {
+            res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4' });
+            res.end(registry.render());
+            return;
+        }
+        if (req.url === '/health') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true }));
+            return;
+        }
+        res.writeHead(404); res.end();
+    });
+    server.on('error', (e) => log('metrics server error:', e.message));
+    server.listen(METRICS_PORT, METRICS_BIND, () => {
+        log(`metrics endpoint http://${METRICS_BIND}:${METRICS_PORT}/metrics`);
+    });
+    return server;
+};
+
+// ── HTTP helpers ────────────────────────────────────────────────────────────
 
 const fetchJson = async (url, init = {}) => {
     const r = await fetch(url, init);
@@ -195,7 +268,177 @@ const pushFile = async (wsId, repoPath, info) => {
     return commit;
 };
 
+// ── Plan + ejecución paralela por workspace ─────────────────────────────────
+
+/**
+ * Clasifica cada path en una operación. No hace I/O remota — solo compara
+ * estado local, remoto y tracked. La ejecución posterior corre en paralelo
+ * con `runPool(SYNC_CONCURRENCY)`.
+ */
+const buildPlan = (allPaths, localByPath, remoteByPath, state, isIgnored) => {
+    const ops = [];
+    for (const safe of allPaths) {
+        if (isHardSkipped(safe)) { ops.push({ kind: 'skip', path: safe, reason: 'hard' }); continue; }
+
+        const remote = remoteByPath.get(safe);
+        const local = localByPath.get(safe);
+
+        if (isIgnored(safe)) { ops.push({ kind: 'ignore', path: safe, remote, local }); continue; }
+
+        const tracked = state[safe];
+        const trackedLocal = tracked?.localHash ?? null;
+        const trackedRemote = tracked?.remoteHash ?? null;
+
+        const localChanged = !!local && local.hash !== trackedLocal;
+        const remoteChanged = !!remote && remote.contentHash !== trackedRemote;
+        const localDeleted = !local && !!trackedLocal;
+        const remoteDeleted = !remote && !!trackedRemote;
+        const isFresh = !tracked;
+
+        if (!local && !remote) { ops.push({ kind: 'forget', path: safe }); continue; }
+
+        // Server gana: cambio remoto (o archivo nuevo en NAS) → pull aunque haya cambio local.
+        if (remoteChanged || (isFresh && remote && !local)) {
+            ops.push({ kind: 'pull', path: safe, remote });
+            continue;
+        }
+
+        if (remoteDeleted && local) {
+            ops.push({ kind: 'del-local', path: safe });
+            continue;
+        }
+
+        if (localChanged || (isFresh && local && !remote)) {
+            ops.push({ kind: 'push', path: safe, local });
+            continue;
+        }
+
+        if (localDeleted && remote) {
+            ops.push({ kind: 'del-remote', path: safe });
+            continue;
+        }
+
+        // Ningún cambio: refresca tracking si ambos lados coinciden.
+        ops.push({ kind: 'noop', path: safe, local, remote });
+    }
+    return ops;
+};
+
+const executeOp = async (op, ctx) => {
+    const { wsId, wsDir, state } = ctx;
+    const safe = op.path;
+    const t0 = Date.now();
+
+    const measure = (kind, ok) => {
+        const dt = Date.now() - t0;
+        opDuration.observe({ op: kind }, dt);
+        ctx.latencies.push(dt);
+        filesProcessed.inc({ op: kind, result: ok ? 'ok' : 'fail' });
+    };
+
+    switch (op.kind) {
+        case 'skip':
+            ctx.counts.skipped++;
+            return;
+        case 'ignore': {
+            if (op.remote) {
+                try {
+                    await deleteRemote(wsId, safe);
+                    ctx.counts.purged++;
+                    verbose('  ✗', safe, '(by .syncignore)');
+                } catch (e) {
+                    verbose('purge fail', safe, e.message);
+                }
+            }
+            if (op.local) {
+                try { await rm(path.join(wsDir, safe), { force: true }); } catch { /* noop */ }
+            }
+            delete state[safe];
+            return;
+        }
+        case 'forget':
+            delete state[safe];
+            return;
+        case 'pull': {
+            const remote = op.remote;
+            if (!remote.signedUrl) { ctx.counts.failed++; measure('pull', false); return; }
+            try {
+                const buf = await fetchBuf(remote.signedUrl);
+                const fullPath = path.join(wsDir, safe);
+                await mkdir(path.dirname(fullPath), { recursive: true });
+                await writeFile(fullPath, buf);
+                const newHash = sha256(buf);
+                state[safe] = { localHash: newHash, remoteHash: remote.contentHash };
+                clearFailCounter(`pull:${wsId}:${safe}`);
+                ctx.counts.downloaded++;
+                bytesTransferred.inc({ direction: 'down' }, buf.length);
+                measure('pull', true);
+                verbose('  ↓', safe);
+            } catch (e) {
+                ctx.counts.failed++;
+                measure('pull', false);
+                if (shouldFailLog(`pull:${wsId}:${safe}`)) log('  pull fail', safe, e.message);
+            }
+            return;
+        }
+        case 'del-local': {
+            try {
+                await rm(path.join(wsDir, safe), { force: true });
+                delete state[safe];
+                ctx.counts.deletedLocal++;
+                measure('del_local', true);
+                verbose('  ✗ local', safe);
+            } catch (e) {
+                ctx.counts.failed++;
+                measure('del_local', false);
+                if (shouldFailLog(`del-local:${wsId}:${safe}`)) log('  delete-local fail', safe, e.message);
+            }
+            return;
+        }
+        case 'push': {
+            const local = op.local;
+            try {
+                const result = await pushFile(wsId, safe, local);
+                state[safe] = { localHash: local.hash, remoteHash: local.hash };
+                clearFailCounter(`push:${wsId}:${safe}`);
+                ctx.counts.uploaded++;
+                if (result.created) ctx.counts.created++;
+                bytesTransferred.inc({ direction: 'up' }, local.size ?? 0);
+                measure('push', true);
+                verbose('  ↑', safe, result.created ? '(NEW)' : `v${result.version}`);
+            } catch (e) {
+                ctx.counts.failed++;
+                measure('push', false);
+                if (shouldFailLog(`push:${wsId}:${safe}`)) log('  push fail', safe, e.message);
+            }
+            return;
+        }
+        case 'del-remote': {
+            try {
+                await deleteRemote(wsId, safe);
+                delete state[safe];
+                ctx.counts.deletedRemote++;
+                measure('del_remote', true);
+                verbose('  ✗ remoto', safe);
+            } catch (e) {
+                ctx.counts.failed++;
+                measure('del_remote', false);
+                if (shouldFailLog(`del-remote:${wsId}:${safe}`)) log('  delete-remote fail', safe, e.message);
+            }
+            return;
+        }
+        case 'noop': {
+            if (op.local && op.remote) {
+                state[safe] = { localHash: op.local.hash, remoteHash: op.remote.contentHash };
+            }
+            ctx.counts.skipped++;
+            return;
+        }
+    }
+};
+
 const syncOne = async (wsId) => {
+    const cycleStart = Date.now();
     const wsDir = path.join(BASE_DIR, wsId);
     await mkdir(wsDir, { recursive: true });
 
@@ -219,9 +462,6 @@ const syncOne = async (wsId) => {
     const ignoreRules = await readSyncignore(wsDir);
     const isIgnored = (relPath) => isWorkspacePathIgnored(ignoreRules, relPath);
 
-    let downloaded = 0, uploaded = 0, skipped = 0, failed = 0, created = 0, purged = 0;
-    let deletedLocal = 0, deletedRemote = 0;
-
     // Conjunto canónico de paths a procesar: union(local ∪ remote ∪ tracked).
     const allPaths = new Set([
         ...localByPath.keys(),
@@ -229,150 +469,69 @@ const syncOne = async (wsId) => {
         ...Object.keys(state)
     ]);
 
-    for (const safe of allPaths) {
-        if (isHardSkipped(safe)) { skipped++; continue; }
-        const remote = remoteByPath.get(safe);
-        const local = localByPath.get(safe);
+    const ops = buildPlan(allPaths, localByPath, remoteByPath, state, isIgnored);
+    queueDepth.set({ wsId }, ops.length);
 
-        // .syncignore — purga zombies del NAS y borra local si está.
-        if (isIgnored(safe)) {
-            if (remote) {
-                try {
-                    await deleteRemote(wsId, safe);
-                    purged++;
-                    verbose('  ✗', safe, '(by .syncignore)');
-                } catch (e) {
-                    verbose('purge fail', safe, e.message);
-                }
-            }
-            if (local) {
-                try { await rm(path.join(wsDir, safe), { force: true }); } catch { /* noop */ }
-            }
-            delete state[safe];
-            continue;
-        }
+    const ctx = {
+        wsId, wsDir, state,
+        counts: { downloaded: 0, uploaded: 0, skipped: 0, failed: 0, created: 0, purged: 0, deletedLocal: 0, deletedRemote: 0 },
+        latencies: []
+    };
 
-        const tracked = state[safe];
-        const trackedLocal = tracked?.localHash ?? null;
-        const trackedRemote = tracked?.remoteHash ?? null;
-
-        const localChanged = !!local && local.hash !== trackedLocal;
-        const remoteChanged = !!remote && remote.contentHash !== trackedRemote;
-        const localDeleted = !local && !!trackedLocal;
-        const remoteDeleted = !remote && !!trackedRemote;
-        const isFresh = !tracked;
-
-        // 1) Ambos lados borrados → limpia state.
-        if (!local && !remote) { delete state[safe]; continue; }
-
-        // 2) Cambio remoto (incluye archivo nuevo en NAS sin tracked) → pull,
-        //    a menos que también haya cambio local (conflicto: server gana).
-        if (remoteChanged || (isFresh && remote && !local)) {
-            if (!remote.signedUrl) { failed++; continue; }
-            try {
-                const buf = await fetchBuf(remote.signedUrl);
-                const fullPath = path.join(wsDir, safe);
-                await mkdir(path.dirname(fullPath), { recursive: true });
-                await writeFile(fullPath, buf);
-                const newHash = sha256(buf);
-                state[safe] = { localHash: newHash, remoteHash: remote.contentHash };
-                clearFailCounter(`pull:${wsId}:${safe}`);
-                downloaded++;
-                verbose('  ↓', safe);
-            } catch (e) {
-                failed++;
-                if (shouldFailLog(`pull:${wsId}:${safe}`)) log('  pull fail', safe, e.message);
-            }
-            continue;
-        }
-
-        // 3) Borrado remoto — propaga al worker.
-        if (remoteDeleted && local) {
-            try {
-                await rm(path.join(wsDir, safe), { force: true });
-                delete state[safe];
-                deletedLocal++;
-                verbose('  ✗ local', safe);
-            } catch (e) {
-                failed++;
-                if (shouldFailLog(`del-local:${wsId}:${safe}`)) log('  delete-local fail', safe, e.message);
-            }
-            continue;
-        }
-
-        // 4) Cambio local (incluye archivo nuevo local sin tracked) → push.
-        if (localChanged || (isFresh && local && !remote)) {
-            try {
-                const result = await pushFile(wsId, safe, local);
-                state[safe] = { localHash: local.hash, remoteHash: local.hash };
-                clearFailCounter(`push:${wsId}:${safe}`);
-                uploaded++;
-                if (result.created) created++;
-                verbose('  ↑', safe, result.created ? '(NEW)' : `v${result.version}`);
-            } catch (e) {
-                failed++;
-                if (shouldFailLog(`push:${wsId}:${safe}`)) log('  push fail', safe, e.message);
-            }
-            continue;
-        }
-
-        // 5) Borrado local — propaga al NAS.
-        if (localDeleted && remote) {
-            try {
-                await deleteRemote(wsId, safe);
-                delete state[safe];
-                deletedRemote++;
-                verbose('  ✗ remoto', safe);
-            } catch (e) {
-                failed++;
-                if (shouldFailLog(`del-remote:${wsId}:${safe}`)) log('  delete-remote fail', safe, e.message);
-            }
-            continue;
-        }
-
-        // 6) Ningún cambio: refresca tracking si vale (cubre el caso de
-        //    servidores con contentHash inconsistente — registramos lo que
-        //    vemos sin re-descargar).
-        if (local && remote) {
-            state[safe] = { localHash: local.hash, remoteHash: remote.contentHash };
-        }
-        skipped++;
-    }
+    await runPool(ops, (op) => executeOp(op, ctx), SYNC_CONCURRENCY);
 
     await writeState(wsDir, state);
 
+    const { downloaded, uploaded, skipped, failed, created, purged, deletedLocal, deletedRemote } = ctx.counts;
+    const cycleDurationMs = Date.now() - cycleStart;
+    lastCycleTs.set({ wsId }, Math.floor(Date.now() / 1000));
+    lastCycleDuration.set({ wsId }, cycleDurationMs);
+    cyclesTotal.inc({ result: failed > 0 ? 'partial' : 'ok' });
+
+    // Log JSON estructurado (parseable por journalctl -o cat | jq)
+    const cycleEvt = {
+        evt: 'sync-cycle',
+        ts: new Date().toISOString(),
+        wsId,
+        downloaded, uploaded, skipped, failed, created, purged,
+        deletedLocal, deletedRemote,
+        queueDepth: ops.length,
+        concurrency: SYNC_CONCURRENCY,
+        cycleDurationMs,
+        p50Ms: percentile(ctx.latencies, 50),
+        p95Ms: percentile(ctx.latencies, 95)
+    };
+
     if (downloaded || uploaded || failed || purged || deletedLocal || deletedRemote) {
         const delPart = (deletedLocal || deletedRemote) ? ` ✗L${deletedLocal} ✗R${deletedRemote}` : '';
-        log(`${wsId} → ↓${downloaded} ↑${uploaded}${created ? ` (${created} nuevos)` : ''}${purged ? ` purg:${purged}` : ''}${delPart} skip:${skipped} fail:${failed}`);
+        log(`${wsId} → ↓${downloaded} ↑${uploaded}${created ? ` (${created} nuevos)` : ''}${purged ? ` purg:${purged}` : ''}${delPart} skip:${skipped} fail:${failed} (${cycleDurationMs}ms)`);
+        console.log(JSON.stringify(cycleEvt));
     } else {
-        verbose(`${wsId} → al día`);
+        verbose(`${wsId} → al día (${cycleDurationMs}ms)`);
+        if (VERBOSE) console.log(JSON.stringify(cycleEvt));
     }
 };
-
-const CONCURRENCY = Number.parseInt(process.env.CONCURRENCY ?? '4', 10);
 
 // Procesa los workspaces en paralelo con un límite de concurrencia, así un
 // workspace gigante (miles de archivos) no bloquea la detección de cambios
 // en los workspaces pequeños.
 const runConcurrent = async (items, fn, limit) => {
-    const queue = [...items];
-    const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-        while (queue.length > 0) {
-            const item = queue.shift();
-            try { await fn(item); }
-            catch (e) { log('worker', item, 'error:', e.message); }
-        }
-    });
-    await Promise.all(workers);
+    const results = await runPool(items, fn, limit);
+    for (let i = 0; i < results.length; i++) {
+        const r = results[i];
+        if (r && !r.ok) log('worker', items[i], 'error:', r.error.message);
+    }
 };
 
 const main = async () => {
-    log(`agora-host-sync iniciado. Hub=${HUB_URL} POLL=${POLL_MS}ms CONCURRENCY=${CONCURRENCY}`);
+    log(`agora-host-sync iniciado. Hub=${HUB_URL} POLL=${POLL_MS}ms CONCURRENCY=${CONCURRENCY} SYNC_CONCURRENCY=${SYNC_CONCURRENCY}`);
+    startMetricsServer();
     while (true) {
         try {
             const revived = await reviveExitedWorkers();
             if (revived > 0) await new Promise(r => setTimeout(r, 3000));
             const tokens = await listWorkers();
+            workersActive.set({}, tokens.length);
             verbose(`workers activos: ${tokens.length}`);
             await runConcurrent(tokens, syncOne, CONCURRENCY);
         } catch (e) {
