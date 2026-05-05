@@ -12,6 +12,9 @@ export const ALLOWED_AGENT_BINARIES = new Set([
 
 const ALWAYS_FORBIDDEN_RE = /\b(sudo|su|passwd|mkfs|fdisk|parted|mount|umount|shutdown|reboot|poweroff|chown|chmod\s+[+]?[rwx]*[s])\b/;
 
+const SHELL_EXPANSION_RE = /\$\(|`|<\(|>\(/;
+const REDIRECT_OUTSIDE_RE = /[>&]\s*\/(?!workspace|tmp\/agora-tmp)/;
+
 function tokenize(segment) {
   return String(segment || '').trim().split(/\s+/).filter(Boolean);
 }
@@ -22,6 +25,9 @@ export function validateAgentCommand(command, options = {}) {
   if (!cmd.trim()) throw new Error('command required');
   if (cmd.length > maxLength) throw new Error('command too long');
   if (cmd.includes('\0')) throw new Error('command contains null bytes');
+  if (SHELL_EXPANSION_RE.test(cmd) || REDIRECT_OUTSIDE_RE.test(cmd)) {
+    throw new Error('shell expansion not allowed');
+  }
   if (ALWAYS_FORBIDDEN_RE.test(cmd)) {
     throw new Error('privileged or destructive system commands are not allowed');
   }

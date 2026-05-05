@@ -12,14 +12,21 @@ import pty from 'node-pty';
 import { validateAgentCommand } from './agent-command-policy.mjs';
 import { generateSignedToken, parseToken } from './worker-token.mjs';
 
+process.on('uncaughtException', (err) => {
+    console.error('[worker] uncaughtException', err);
+});
+process.on('unhandledRejection', (reason) => {
+    console.error('[worker] unhandledRejection', reason);
+});
+
 const NEXUS_URL = process.env.NEXUS_URL || 'http://localhost:3010';
 
 /**
  * Validates and parses the worker token.
  * WORKER_TOKEN is treated as the Workspace Identifier (Identity).
  */
-const WORKER_ID = process.env.WORKER_TOKEN || '';
-const WORKER_SECRET = process.env.WORKER_SOCKET_SECRET || process.env.WORKER_SECRET || '';
+const WORKER_ID = (process.env.WORKER_TOKEN || '').trim().replace(/\\n/g, '');
+const WORKER_SECRET = (process.env.WORKER_SOCKET_SECRET || process.env.WORKER_SECRET || '').trim().replace(/\\n/g, '');
 const SAFE_WORKSPACE_ID = /^[a-zA-Z0-9_:-]+$/;
 
 if (WORKER_ID && !SAFE_WORKSPACE_ID.test(WORKER_ID)) {
@@ -86,6 +93,11 @@ socket.on('reconnect_attempt', (attemptNumber) => {
 
 const sessions = new Map();
 const SESSION_LAST_ACTIVITY = new Map();
+const SESSION_OUTPUT_BUDGET = new Map();
+const OUTPUT_CHUNK_SIZE = 64 * 1024;
+const OUTPUT_RATE_WINDOW_MS = 1000;
+const OUTPUT_RATE_LIMIT_BYTES = 1 * 1024 * 1024;
+const MAX_EXECUTE_INPUT_BYTES = 8 * 1024;
 const MAX_SESSIONS = 50;
 const SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 min
 const HEARTBEAT_MS = 10 * 1000;
@@ -120,6 +132,7 @@ setInterval(() => {
                 sessions.delete(sessionId);
             }
             SESSION_LAST_ACTIVITY.delete(sessionId);
+            SESSION_OUTPUT_BUDGET.delete(sessionId);
             socket.emit('session-ended', { sessionId, reason: 'Session idle timeout' });
         }
     }
@@ -234,6 +247,7 @@ socket.on('session-created', (data = {}) => {
             if (oldPty) oldPty.kill();
             sessions.delete(oldId);
             SESSION_LAST_ACTIVITY.delete(oldId);
+            SESSION_OUTPUT_BUDGET.delete(oldId);
             socket.emit('session-ended', { sessionId: oldId, reason: 'Session limit reached' });
             console.warn(`⚠️ Session limit reached, killed oldest session ${oldId}`);
         }
@@ -266,15 +280,51 @@ socket.on('session-created', (data = {}) => {
 
     sessions.set(sessionId, ptyProcess);
     SESSION_LAST_ACTIVITY.set(sessionId, Date.now());
+    SESSION_OUTPUT_BUDGET.set(sessionId, { windowStart: Date.now(), bytes: 0, truncatedNotified: false });
+
+    const emitChunked = async (data) => {
+        const buf = Buffer.from(data, 'utf8');
+        for (let i = 0; i < buf.length; i += OUTPUT_CHUNK_SIZE) {
+            const slice = buf.subarray(i, i + OUTPUT_CHUNK_SIZE).toString('utf8');
+            socket.emit('output', { sessionId, data: slice });
+            if (i + OUTPUT_CHUNK_SIZE < buf.length) {
+                await new Promise((r) => setImmediate(r));
+            }
+        }
+    };
 
     ptyProcess.onData((data) => {
-        socket.emit('output', { sessionId, data });
+        const now = Date.now();
+        const budget = SESSION_OUTPUT_BUDGET.get(sessionId);
+        if (budget) {
+            if (now - budget.windowStart > OUTPUT_RATE_WINDOW_MS) {
+                budget.windowStart = now;
+                budget.bytes = 0;
+                budget.truncatedNotified = false;
+            }
+            const len = Buffer.byteLength(data, 'utf8');
+            if (budget.bytes + len > OUTPUT_RATE_LIMIT_BYTES) {
+                budget.bytes += len;
+                if (!budget.truncatedNotified) {
+                    budget.truncatedNotified = true;
+                    socket.emit('output', { sessionId, data: '\n[output truncated: rate limit]\n' });
+                }
+                return;
+            }
+            budget.bytes += len;
+        }
+        if (data.length > OUTPUT_CHUNK_SIZE) {
+            emitChunked(data).catch((err) => console.error('[worker] emitChunked error', err));
+        } else {
+            socket.emit('output', { sessionId, data });
+        }
     });
 
     ptyProcess.onExit(({ exitCode }) => {
         console.log(`📟 PTY for session ${sessionId} exited with code ${exitCode}`);
         sessions.delete(sessionId);
         SESSION_LAST_ACTIVITY.delete(sessionId);
+        SESSION_OUTPUT_BUDGET.delete(sessionId);
         socket.emit('session-ended', { sessionId, reason: `Shell exited (code ${exitCode})` });
     });
 });
@@ -283,10 +333,29 @@ socket.on('execute', (data) => {
     const { sessionId, command } = data;
     const ptyProcess = sessions.get(sessionId);
 
-    if (ptyProcess) {
-        SESSION_LAST_ACTIVITY.set(sessionId, Date.now());
-        ptyProcess.write(command);
+    if (!ptyProcess) return;
+
+    const cmd = typeof command === 'string' ? command : String(command || '');
+    if (Buffer.byteLength(cmd, 'utf8') > MAX_EXECUTE_INPUT_BYTES) {
+        console.warn(`[worker] execute input exceeds ${MAX_EXECUTE_INPUT_BYTES}B for session ${sessionId}, ignoring`);
+        return;
     }
+    for (let i = 0; i < cmd.length; i++) {
+        const code = cmd.charCodeAt(i);
+        if (code === 0x00) {
+            console.warn(`[worker] execute input contains null byte for session ${sessionId}, ignoring`);
+            return;
+        }
+        const isPrintable = code >= 0x20 && code <= 0x7e;
+        const isAllowedControl = code === 0x09 || code === 0x0a || code === 0x0d || code === 0x08 || code === 0x03 || code === 0x04 || code === 0x1b;
+        if (!isPrintable && !isAllowedControl && code < 0x80) {
+            console.warn(`[worker] execute input contains forbidden control byte 0x${code.toString(16)} for session ${sessionId}, ignoring`);
+            return;
+        }
+    }
+
+    SESSION_LAST_ACTIVITY.set(sessionId, Date.now());
+    ptyProcess.write(cmd);
 });
 
 socket.on('resize', (data) => {
@@ -311,6 +380,7 @@ const killSession = (data) => {
         ptyProcess.kill();
         sessions.delete(sessionId);
         SESSION_LAST_ACTIVITY.delete(sessionId);
+        SESSION_OUTPUT_BUDGET.delete(sessionId);
     }
 };
 
@@ -324,4 +394,5 @@ socket.on('disconnect', () => {
     }
     sessions.clear();
     SESSION_LAST_ACTIVITY.clear();
+    SESSION_OUTPUT_BUDGET.clear();
 });
