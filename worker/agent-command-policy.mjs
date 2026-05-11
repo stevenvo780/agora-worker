@@ -2,6 +2,10 @@ export const ALLOWED_AGENT_BINARIES = new Set([
   'ls', 'pwd', 'cat', 'echo', 'head', 'tail', 'wc', 'grep', 'find', 'sort', 'uniq',
   'cut', 'awk', 'sed', 'tr', 'tee', 'diff', 'stat', 'file', 'date',
   'mkdir', 'touch', 'cp', 'mv', 'rm', 'ln',
+  // base64 es necesario para write_worker_file (decode del contenido enviado
+  // por el backend). Sin esto, el comando `... | base64 -d > path` falla con
+  // `binary "base64" no está en la whitelist`. Bug I-1 relacionado.
+  'base64',
   'git',
   'node', 'npm', 'pnpm', 'npx', 'yarn',
   'python', 'python3', 'pip', 'pip3',

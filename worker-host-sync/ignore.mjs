@@ -10,15 +10,28 @@
  */
 
 // Internos al daemon o al runtime — nunca tocar (en ambas direcciones).
-export const HARD_SKIP = ['.git/', 'repos/', '.agora-host-sync.json', '.st-guide.md'];
+// `.scratch/` y prefijo `tmp-` son convención del agente IA y del usuario para
+// archivos efímeros que no deben adoptarse al NAS ni borrarse del FS (el
+// daemon antes los detectaba como huérfanos y los purgaba ~10s después; Bug I-2).
+export const HARD_SKIP = [
+    '.git/',
+    'repos/',
+    '.agora-host-sync.json',
+    '.st-guide.md',
+    '.scratch/',
+    '.agent-tmp/'
+];
 
 // Reglas intrínsecas siempre activas. Cubren temporales de editores que
-// nunca deben llegar al NAS.
+// nunca deben llegar al NAS, además de prefijos `tmp-*` usados por el agente
+// IA y por el usuario para scratch files (Bug I-2 fallback B).
 const BUILTIN_IGNORE_TEXT = [
     '*.swp', '*.swo', '*.swn',
     '*~',
     '.~lock.*', '.#*',
-    '.DS_Store', 'Thumbs.db', 'desktop.ini'
+    '.DS_Store', 'Thumbs.db', 'desktop.ini',
+    'tmp-*',
+    '*.tmp'
 ].join('\n');
 
 export const compileIgnore = (txt) => {
