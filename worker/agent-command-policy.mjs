@@ -1,6 +1,8 @@
 export const ALLOWED_AGENT_BINARIES = new Set([
   'ls', 'pwd', 'cat', 'echo', 'head', 'tail', 'wc', 'grep', 'find', 'sort', 'uniq',
   'cut', 'awk', 'sed', 'tr', 'tee', 'diff', 'stat', 'file', 'date',
+  // Bug I-1: read-only de entorno — whoami y similares bloqueaban sin razón.
+  'whoami', 'id', 'hostname', 'uname', 'uptime', 'df', 'free', 'env',
   'mkdir', 'touch', 'cp', 'mv', 'rm', 'ln',
   // base64 es necesario para write_worker_file (decode del contenido enviado
   // por el backend). Sin esto, el comando `... | base64 -d > path` falla con
