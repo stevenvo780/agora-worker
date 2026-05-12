@@ -1,15 +1,28 @@
 # AgoraWorker
 
-Runtime de workers por workspace y daemon host-sync. En producción corren ~27 containers `edu-worker-<wsId>` en `humanizar2` (host activo).
+Runtime de workers por workspace y daemon host-sync. En producción
+corren ~35 containers `edu-worker-<wsId>` en `humanizar2` (host activo).
+Todos apuntan al hub vía `NEXUS_URL=https://hub.humanizar-dev.cloud`.
 
 > **Operación / restart / docker daemon crashes**: ver [`../RUNBOOK_OPS.md §3, §12`](../RUNBOOK_OPS.md).
 > **Detalle arquitectura/secrets**: `../CLAUDE.md` (raíz workspace).
 
 ## Partes
 
-- `worker/`: contenedor Node que abre PTY, se registra en AgoraHub y ejecuta comandos del agente bajo whitelist (~40 binarios seguros).
-- `worker-host-sync/`: daemon del host (`agora-host-sync.service`) que sincroniza `/workspace` contra AgoraBack/MinIO/Firestore cada 5s y revive containers caídos.
+- `worker/`: contenedor Node que abre PTY, se registra en AgoraHub y ejecuta comandos del agente bajo whitelist (~40 binarios seguros, incluye `base64` agregado en 2026-05). El handler `runWorkerCommand` aplica una policy tri-tier: destructivos siempre piden confirm, safe-reads ejecutan directo, resto requiere confirm.
+- `worker-host-sync/`: daemon del host (`agora-host-sync.service`) que sincroniza `/workspace` contra AgoraBack/MinIO/Firestore cada 5s y revive containers caídos. Ignora `.scratch/`, `.agent-tmp/`, `tmp-*`, `*.tmp` (Bug I-2 Opción B).
 - `desplieges-prod/`: scripts operativos de despliegue (`deploy_hub.sh`, `deploy_docker.sh`, `update_st_workers.sh`).
+
+## Comportamiento conocido
+
+- El handler `agent-command` ya **no** prepende `cd` a los comandos
+  del agente IA (`worker.ts:489-585`). El cwd queda automáticamente
+  en `/workspace`. Si el agente quiere cambiar de directorio, debe
+  usar la ruta absoluta en el comando.
+- `runWorkerCommand` tri-tier policy:
+  - **destructivos** (`rm`, `mv`, `truncate`, etc.) → siempre piden confirm
+  - **safe-reads** (`ls`, `cat`, `head`, `tail`, `pwd`, etc.) → ejecutan directo
+  - **resto** → requiere confirm explícito del user via UI
 
 ## Setup local
 
