@@ -130,7 +130,6 @@ const listWorkers = async () => {
     return out.split('\n').map(s => s.trim()).filter(Boolean).map(n => n.replace(/^edu-worker-/, ''));
 };
 
-// Devuelve los nombres completos de contenedores `edu-worker-*` Exited.
 const listExitedWorkers = async () => {
     const out = await dockerCmd(['ps', '-a', '--filter', 'name=edu-worker-', '--filter', 'status=exited', '--format', '{{.Names}}']);
     return out.split('\n').map(s => s.trim()).filter(Boolean);
@@ -209,7 +208,6 @@ const walkLocal = async (wsDir) => {
                     const cacheKey = `${fullPath}`;
                     const cached = hashCache.get(cacheKey);
                     if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
-                        // mtime y size idénticos → reusa hash y referencia diferida al buf.
                         out.set(relPath, { hash: cached.hash, size: st.size, getBuf: () => readFile(fullPath) });
                         continue;
                     }
@@ -318,7 +316,6 @@ const buildPlan = (allPaths, localByPath, remoteByPath, state, isIgnored) => {
             continue;
         }
 
-        // Ningún cambio: refresca tracking si ambos lados coinciden.
         ops.push({ kind: 'noop', path: safe, local, remote });
     }
     return ops;
@@ -488,7 +485,6 @@ const syncOne = async (wsId) => {
     lastCycleDuration.set({ wsId }, cycleDurationMs);
     cyclesTotal.inc({ result: failed > 0 ? 'partial' : 'ok' });
 
-    // Log JSON estructurado (parseable por journalctl -o cat | jq)
     const cycleEvt = {
         evt: 'sync-cycle',
         ts: new Date().toISOString(),
@@ -512,9 +508,6 @@ const syncOne = async (wsId) => {
     }
 };
 
-// Procesa los workspaces en paralelo con un límite de concurrencia, así un
-// workspace gigante (miles de archivos) no bloquea la detección de cambios
-// en los workspaces pequeños.
 const runConcurrent = async (items, fn, limit) => {
     const results = await runPool(items, fn, limit);
     for (let i = 0; i < results.length; i++) {
