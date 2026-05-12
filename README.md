@@ -1,12 +1,15 @@
 # AgoraWorker
 
-Runtime de workers por workspace y daemon host-sync.
+Runtime de workers por workspace y daemon host-sync. En producción corren ~27 containers `edu-worker-<wsId>` en `humanizar2` (host activo).
+
+> **Operación / restart / docker daemon crashes**: ver [`../RUNBOOK_OPS.md §3, §12`](../RUNBOOK_OPS.md).
+> **Detalle arquitectura/secrets**: `../CLAUDE.md` (raíz workspace).
 
 ## Partes
 
-- `worker/`: contenedor Node que abre PTY, se registra en AgoraHub y ejecuta comandos del agente bajo whitelist.
-- `worker-host-sync/`: daemon del host que sincroniza `/workspace` contra AgoraBack/MinIO/Firestore.
-- `desplieges-prod/`: scripts operativos de despliegue en `stev-server`.
+- `worker/`: contenedor Node que abre PTY, se registra en AgoraHub y ejecuta comandos del agente bajo whitelist (~40 binarios seguros).
+- `worker-host-sync/`: daemon del host (`agora-host-sync.service`) que sincroniza `/workspace` contra AgoraBack/MinIO/Firestore cada 5s y revive containers caídos.
+- `desplieges-prod/`: scripts operativos de despliegue (`deploy_hub.sh`, `deploy_docker.sh`, `update_st_workers.sh`).
 
 ## Setup local
 
@@ -34,3 +37,82 @@ Variables principales del daemon:
 ## Recuperación
 
 El daemon revive contenedores `edu-worker-*` en estado `exited`. Si Hub reinicia, los workers reconectan por socket.io y regeneran token firmado fresco en cada intento. Los comandos agente no se persisten: un restart durante ejecución devuelve timeout/error al backend y debe reintentarse.
+
+## Despliegue
+
+### Imagen del worker
+
+```bash
+cd worker
+docker build -t stevenvo780/edu-worker:latest .
+docker push stevenvo780/edu-worker:latest
+
+# Recrear los ~27 containers con la imagen nueva
+ssh nas 'ssh humanizar2 "echo PASS | sudo -S edu-worker-manager update all"'
+```
+
+### Daemon agora-host-sync
+
+```bash
+cd worker-host-sync
+./deploy.sh    # ver scripts internos; copia agora-host-sync.mjs y reinicia systemd
+```
+
+Cada worker se reconecta al hub en <5s tras recreación.
+
+## Instalación en Fedora / RHEL / CentOS
+
+Fedora usa Podman por defecto (CLI compatible con Docker). El script de instalación detecta tu distro automáticamente y elige `docker` o `podman`.
+
+### Opción A — Script automático (recomendado)
+
+```bash
+curl -sLO https://raw.githubusercontent.com/stevenvo780/agora-worker/master/scripts/install-worker.sh
+chmod +x install-worker.sh
+WORKER_SECRET=<tu-secret> ./install-worker.sh <wsId>
+```
+
+Detecta `docker`/`podman` ya instalados. Si no hay ninguno: instala Podman en Fedora/RHEL/CentOS/Rocky/Alma y Docker en Ubuntu/Debian/Arch.
+
+### Opción B — Podman manual
+
+```bash
+sudo dnf install -y podman
+podman pull stevenvo780/edu-worker:latest
+podman run -d --name edu-worker-<wsId> --restart=unless-stopped --network=host \
+  -e NEXUS_URL=https://hub.humanizar-dev.cloud \
+  -e WORKER_TOKEN=<wsId> \
+  -e WORKER_SECRET=<secret> \
+  stevenvo780/edu-worker:latest
+```
+
+### Opción C — Docker CE en Fedora
+
+Si preferís Docker oficial:
+
+```bash
+sudo dnf -y install dnf-plugins-core
+sudo dnf-3 config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo
+sudo dnf install -y docker-ce docker-ce-cli containerd.io
+sudo systemctl enable --now docker
+sudo usermod -aG docker $USER
+# logout / login y después:
+docker pull stevenvo780/edu-worker:latest
+```
+
+### Permisos rootless (Podman)
+
+Si querés correr sin sudo en Fedora:
+
+```bash
+sudo loginctl enable-linger $USER
+podman system migrate
+```
+
+Esto permite que tu user mantenga containers vivos al cerrar sesión.
+
+### Troubleshooting
+
+- **"Permission denied: /var/run/docker.sock"**: necesitás `sudo` o agregarte al grupo `docker` (reinicia sesión).
+- **Podman + `--network=host`**: en rootless Fedora puede fallar. Usar `-p 3010:3010` en su lugar o configurar `slirp4netns`.
+- **SELinux bloquea**: Fedora trae SELinux enforcing. Añadir `--security-opt label=disable` al run command.
