@@ -175,13 +175,6 @@ const shouldFailLog = (key) => {
 };
 const clearFailCounter = (key) => failCounter.delete(key);
 
-// Orphan tracker: registra (contentHash visto, nº de intentos 404) por clave
-// "pull:<wsId>:<path>". Tras ORPHAN_THRESHOLD intentos con el mismo contentHash,
-// el path se marca como ORPHAN en state para detener el loop infinito de failed++.
-// Si el manifest cambia (nuevo contentHash), el contador se resetea.
-const ORPHAN_THRESHOLD = 3;
-const orphanCounter = new Map(); // key → { seenHash: string, attempts: number }
-
 const readSyncignore = async (wsDir) => {
     let userRules = [];
     try {
@@ -366,20 +359,6 @@ const executeOp = async (op, ctx) => {
         case 'pull': {
             const remote = op.remote;
             if (!remote.signedUrl) { ctx.counts.failed++; measure('pull', false); return; }
-
-            // Si ya fue marcado ORPHAN para este contentHash, saltar sin failed++.
-            const orphanKey = `pull:${wsId}:${safe}`;
-            if (state[safe]?.remoteHash === 'ORPHAN') {
-                const tracked = orphanCounter.get(orphanKey);
-                if (tracked?.seenHash === remote.contentHash) {
-                    measure('pull', false);
-                    return;
-                }
-                // El manifest cambió (nuevo contentHash) → limpiar marca y reintentar.
-                delete state[safe];
-                orphanCounter.delete(orphanKey);
-            }
-
             try {
                 const buf = await fetchBuf(remote.signedUrl);
                 const fullPath = path.join(wsDir, safe);
@@ -387,30 +366,15 @@ const executeOp = async (op, ctx) => {
                 await writeFile(fullPath, buf);
                 const newHash = sha256(buf);
                 state[safe] = { localHash: newHash, remoteHash: remote.contentHash };
-                clearFailCounter(orphanKey);
-                orphanCounter.delete(orphanKey);
+                clearFailCounter(`pull:${wsId}:${safe}`);
                 ctx.counts.downloaded++;
                 bytesTransferred.inc({ direction: 'down' }, buf.length);
                 measure('pull', true);
                 verbose('  ↓', safe);
             } catch (e) {
-                const is404 = e.message.includes('HTTP 404');
-                if (is404) {
-                    const prev = orphanCounter.get(orphanKey);
-                    const sameHash = prev?.seenHash === remote.contentHash;
-                    const attempts = sameHash ? prev.attempts + 1 : 1;
-                    orphanCounter.set(orphanKey, { seenHash: remote.contentHash, attempts });
-
-                    if (attempts >= ORPHAN_THRESHOLD) {
-                        state[safe] = { localHash: null, remoteHash: 'ORPHAN' };
-                        log(`[orphan] ${wsId}/${safe} - marked ORPHAN after ${attempts} failed pulls`);
-                        measure('pull', false);
-                        return;
-                    }
-                }
                 ctx.counts.failed++;
                 measure('pull', false);
-                if (shouldFailLog(orphanKey)) log('  pull fail', safe, e.message);
+                if (shouldFailLog(`pull:${wsId}:${safe}`)) log('  pull fail', safe, e.message);
             }
             return;
         }
