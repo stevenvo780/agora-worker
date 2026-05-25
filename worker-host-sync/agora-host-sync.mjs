@@ -42,7 +42,39 @@ const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
 const verbose = (...a) => { if (VERBOSE) log(...a); };
 
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');
-const authHeaders = (wsId, userId = null) => buildAuthHeaders(WORKER_SECRET, wsId, userId);
+
+// El nombre del container `edu-worker-<wsId>` puede contener un UID puro
+// (workspace personal) o un wsId shared. El back distingue con el prefijo
+// `personal:` en el token, por eso NO alcanza con usar el wsId crudo: hay
+// que leer el `WORKER_TOKEN` real del env del container vía `docker inspect`.
+// Cacheado por wsId; el token no cambia mientras el container exista.
+const workerTokenCache = new Map();
+const resolveWorkerToken = async (wsId) => {
+    const cached = workerTokenCache.get(wsId);
+    if (cached) return cached;
+    try {
+        const out = await dockerCmd([
+            'inspect', `edu-worker-${wsId}`,
+            '--format', '{{range .Config.Env}}{{println .}}{{end}}'
+        ]);
+        const line = out.split('\n').find((l) => l.startsWith('WORKER_TOKEN='));
+        if (line) {
+            const token = line.slice('WORKER_TOKEN='.length).trim();
+            if (token) {
+                workerTokenCache.set(wsId, token);
+                return token;
+            }
+        }
+    } catch (e) {
+        verbose(`resolveWorkerToken(${wsId}) fail:`, e.message);
+    }
+    // Fallback conservador: usar wsId crudo (comportamiento anterior). Esto
+    // rompe personal workspaces pero evita romper shared si inspect falla.
+    workerTokenCache.set(wsId, wsId);
+    return wsId;
+};
+
+const authHeaders = (token, userId = null) => buildAuthHeaders(WORKER_SECRET, token, userId);
 
 // ── Métricas ────────────────────────────────────────────────────────────────
 
@@ -236,16 +268,16 @@ const guessContentType = (name) => {
     return 'application/octet-stream';
 };
 
-const deleteRemote = async (wsId, repoPath) => {
-    const headers = { ...authHeaders(wsId), 'Content-Type': 'application/json' };
+const deleteRemote = async (token, repoPath) => {
+    const headers = { ...authHeaders(token), 'Content-Type': 'application/json' };
     return fetchJson(`${HUB_URL}/api/sync/worker-delete`, {
         method: 'POST', headers,
         body: JSON.stringify({ repoPath })
     });
 };
 
-const pushFile = async (wsId, repoPath, info) => {
-    const headers = { ...authHeaders(wsId), 'Content-Type': 'application/json' };
+const pushFile = async (token, repoPath, info) => {
+    const headers = { ...authHeaders(token), 'Content-Type': 'application/json' };
     const contentType = guessContentType(repoPath);
     const upload = await fetchJson(`${HUB_URL}/api/sync/worker-upload-url`, {
         method: 'POST', headers,
@@ -322,7 +354,7 @@ const buildPlan = (allPaths, localByPath, remoteByPath, state, isIgnored) => {
 };
 
 const executeOp = async (op, ctx) => {
-    const { wsId, wsDir, state } = ctx;
+    const { wsId, token, wsDir, state } = ctx;
     const safe = op.path;
     const t0 = Date.now();
 
@@ -340,7 +372,7 @@ const executeOp = async (op, ctx) => {
         case 'ignore': {
             if (op.remote) {
                 try {
-                    await deleteRemote(wsId, safe);
+                    await deleteRemote(token, safe);
                     ctx.counts.purged++;
                     verbose('  ✗', safe, '(by .syncignore)');
                 } catch (e) {
@@ -395,7 +427,7 @@ const executeOp = async (op, ctx) => {
         case 'push': {
             const local = op.local;
             try {
-                const result = await pushFile(wsId, safe, local);
+                const result = await pushFile(token, safe, local);
                 state[safe] = { localHash: local.hash, remoteHash: local.hash };
                 clearFailCounter(`push:${wsId}:${safe}`);
                 ctx.counts.uploaded++;
@@ -412,7 +444,7 @@ const executeOp = async (op, ctx) => {
         }
         case 'del-remote': {
             try {
-                await deleteRemote(wsId, safe);
+                await deleteRemote(token, safe);
                 delete state[safe];
                 ctx.counts.deletedRemote++;
                 measure('del_remote', true);
@@ -439,9 +471,12 @@ const syncOne = async (wsId) => {
     const wsDir = path.join(BASE_DIR, wsId);
     await mkdir(wsDir, { recursive: true });
 
+    // Resolver el token real del worker (puede tener prefijo `personal:`).
+    const token = await resolveWorkerToken(wsId);
+
     const data = await fetchJson(
-        `${HUB_URL}/api/sync/worker-list?workspaceId=${encodeURIComponent(wsId)}`,
-        { headers: authHeaders(wsId) }
+        `${HUB_URL}/api/sync/worker-list?workspaceId=${encodeURIComponent(token)}`,
+        { headers: authHeaders(token) }
     );
     if (!Array.isArray(data.items)) { log(wsId, 'respuesta inesperada'); return; }
     const remoteByPath = new Map(data.items.map(i => [i.repoPath, i]));
@@ -470,7 +505,7 @@ const syncOne = async (wsId) => {
     queueDepth.set({ wsId }, ops.length);
 
     const ctx = {
-        wsId, wsDir, state,
+        wsId, token, wsDir, state,
         counts: { downloaded: 0, uploaded: 0, skipped: 0, failed: 0, created: 0, purged: 0, deletedLocal: 0, deletedRemote: 0 },
         latencies: []
     };

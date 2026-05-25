@@ -1,20 +1,21 @@
 [Unit]
-Description=Agora host sync — espeja workers con NAS y revive contenedores edu-worker
+Description=Agora host sync — espeja workers con MinIO/Back y revive contenedores edu-worker
 After=docker.service network-online.target
 Wants=docker.service network-online.target
 
 [Service]
 Type=simple
-User=stev
-Group=stev
-# WORKER_SYNC_SECRET se inyecta vía drop-in en /etc/systemd/system/agora-host-sync.service.d/
-# WORKER_SECRET sigue soportado como fallback legacy.
+User=humanizar
+Group=humanizar
+# Variables de entorno principales (WORKER_SECRET, WORKER_SYNC_SECRET, NEXUS_URL, etc.)
+EnvironmentFile=/etc/agora-host-sync.env
+# Fallback legacy para vars adicionales del host de workers
 EnvironmentFile=-/etc/edu-worker/worker.env
-ExecStart=/usr/bin/node /home/stev/bin/agora-host-sync.mjs
+ExecStart=/usr/bin/node /opt/agora-host-sync/agora-host-sync.mjs
 Restart=always
 RestartSec=10
-StandardOutput=append:/home/stev/logs/agora-host-sync.log
-StandardError=append:/home/stev/logs/agora-host-sync.log
+StandardOutput=append:/home/humanizar/logs/agora-host-sync.log
+StandardError=append:/home/humanizar/logs/agora-host-sync.log
 
 [Install]
 WantedBy=multi-user.target
