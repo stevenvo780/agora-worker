@@ -72,6 +72,32 @@ ensure_dirs() {
   mkdir -p "$BASE_MOUNT_PATH/workspaces"
 }
 
+# Group shared between humanizar (uid 1001, sync daemon) and the container
+# user (estudiante uid 1000 = ils-server). Without it the daemon can't write
+# the per-path state files in the workspace and the MinIO->worker pull fails
+# with EACCES, breaking sync after every worker recreate.
+SYNC_GROUP="${SYNC_GROUP:-agora-sync}"
+SYNC_DAEMON_USER="${SYNC_DAEMON_USER:-humanizar}"
+
+ensure_sync_group() {
+  groupadd -f "$SYNC_GROUP" 2>/dev/null || true
+  if id "$SYNC_DAEMON_USER" >/dev/null 2>&1; then
+    usermod -aG "$SYNC_GROUP" "$SYNC_DAEMON_USER" 2>/dev/null || true
+  fi
+}
+
+# Make a workspace dir writable by the sync daemon: owned by the container
+# user (uid 1000) but group $SYNC_GROUP with setgid so children inherit the
+# group and stay group-writable.
+apply_sync_perms() {
+  local dir="$1"
+  [ -d "$dir" ] || return 0
+  ensure_sync_group
+  chown -R 1000:"$SYNC_GROUP" "$dir" 2>/dev/null || true
+  chmod -R g+rwX "$dir" 2>/dev/null || true
+  find "$dir" -type d -exec chmod g+s {} + 2>/dev/null || true
+}
+
 get_container_name() {
   local id="$1"
   echo "edu-worker-${id}" | tr ':' '-' | tr -cd '[:alnum:]-_' | head -c 63
@@ -118,8 +144,9 @@ cmd_add() {
   local mount_path="${BASE_MOUNT_PATH}/workspaces/${safe_id}"
 
   mkdir -p "$mount_path"
-  # Ensure workspace dir is owned by uid 1000 (estudiante inside container)
-  chown 1000:1000 "$mount_path"
+  # Owned by uid 1000 (estudiante inside container) but group agora-sync +
+  # setgid so the sync daemon (humanizar uid 1001) can write state files.
+  apply_sync_perms "$mount_path"
 
   cat > "$config_file" <<EOF
 WORKSPACE_ID="${workspace_id}"
@@ -187,16 +214,26 @@ start_worker() {
 
   docker rm -f "$container_name" 2>/dev/null || true
 
-  # Ensure workspace mount is owned by uid 1000 (estudiante inside container)
-  [ -d "${MOUNT_PATH}" ] && chown 1000:1000 "${MOUNT_PATH}" 2>/dev/null || true
+  # Ensure workspace mount is owned by uid 1000 (estudiante) but group
+  # agora-sync + setgid so the sync daemon (humanizar) can write state files.
+  apply_sync_perms "${MOUNT_PATH}"
 
   # Persistent volume for entire /home/estudiante (preserves .codex, .gemini, and any future tools)
   local home_persist_path="${BASE_MOUNT_PATH}/home/${safe_id}"
   mkdir -p "${home_persist_path}"
   chown 1000:1000 "${home_persist_path}" 2>/dev/null || true
 
+  # gid of the host sync group, passed to the container so its entrypoint
+  # chowns /workspace to estudiante:<this gid> (group-writable + setgid) and
+  # the sync daemon (humanizar) can write state files post-recreate.
+  ensure_sync_group
+  local sync_gid
+  sync_gid="$(getent group "$SYNC_GROUP" | cut -d: -f3)"
+  sync_gid="${sync_gid:-1002}"
+
   local args=(run -d --name "$container_name" --network=host --restart unless-stopped)
   args+=(-e "NEXUS_URL=$NEXUS_URL")
+  args+=(-e "SYNC_GID=$sync_gid")
   args+=(-e "WORKER_TOKEN=$WORKER_TOKEN")
   [ -n "$_WORKER_SECRET" ] && args+=(-e "WORKER_SECRET=$_WORKER_SECRET")
   [ -n "$_WORKER_SOCKET_SECRET" ] && args+=(-e "WORKER_SOCKET_SECRET=$_WORKER_SOCKET_SECRET")

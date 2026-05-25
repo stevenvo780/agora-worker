@@ -229,10 +229,16 @@ echo "🔧 Fixing workspace permissions and cleaning up..."
 sudo find "${WORKSPACE_DIR}" -maxdepth 10 -type l ! -exec test -e {} \; -delete 2>/dev/null && \
     echo "   🗑️ Removed broken symlinks" || true
 
-# Fix ownership: ensure everything is owned by estudiante
-# This fixes EACCES errors when sync_agent runs as estudiante
-sudo chown -R estudiante:estudiante "${WORKSPACE_DIR}" 2>/dev/null || true
-echo "   ✅ Permissions fixed (estudiante:estudiante)"
+# Fix ownership: files owned by estudiante (in-container writer) but group
+# set to the host sync group (gid ${SYNC_GID:-1002} = agora-sync on ils-server)
+# with group-write + setgid so the host sync daemon (humanizar uid 1001) can
+# write its per-path state files. Without the group/setgid the daemon hits
+# EACCES and the MinIO->worker pull breaks after every container recreate.
+SYNC_GID="${SYNC_GID:-1002}"
+sudo chown -R "estudiante:${SYNC_GID}" "${WORKSPACE_DIR}" 2>/dev/null || true
+sudo chmod -R g+rwX "${WORKSPACE_DIR}" 2>/dev/null || true
+sudo find "${WORKSPACE_DIR}" -type d -exec chmod g+s {} + 2>/dev/null || true
+echo "   ✅ Permissions fixed (estudiante:${SYNC_GID}, group-writable + setgid)"
 # ── end setup ─────────────────────────────────────────────────────
 
 # ── Auto-install user packages ────────────────────────────────────
