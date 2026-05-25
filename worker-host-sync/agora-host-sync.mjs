@@ -22,7 +22,7 @@ import { buildAuthHeaders } from './auth.mjs';
 import { runPool } from './pool.mjs';
 import { MetricsRegistry, percentile } from './metrics.mjs';
 
-const HUB_URL = process.env.AGORA_HUB_URL ?? 'https://agora-backend-578238159459.us-central1.run.app';
+const HUB_URL = process.env.AGORA_HUB_URL ?? process.env.NEXUS_URL ?? 'https://agora-backend-578238159459.us-central1.run.app';
 const WORKER_SECRET = process.env.WORKER_SYNC_SECRET || process.env.WORKER_SECRET;
 const BASE_DIR = process.env.BASE_DIR ?? '/home/stev/edu-worker/workspaces';
 const POLL_MS = Number.parseInt(process.env.POLL_MS ?? '5000', 10);
@@ -474,12 +474,30 @@ const syncOne = async (wsId) => {
     // Resolver el token real del worker (puede tener prefijo `personal:`).
     const token = await resolveWorkerToken(wsId);
 
-    const data = await fetchJson(
-        `${HUB_URL}/api/sync/worker-list?workspaceId=${encodeURIComponent(token)}`,
-        { headers: authHeaders(token) }
-    );
-    if (!Array.isArray(data.items)) { log(wsId, 'respuesta inesperada'); return; }
-    const remoteByPath = new Map(data.items.map(i => [i.repoPath, i]));
+    // worker-list pagina por `updatedAt asc` (los más nuevos quedan al final),
+    // así que un workspace con > limit docs deja los archivos recién editados
+    // en la web fuera de la primera página. Hay que seguir `nextCursor` hasta
+    // agotar la lista, o el plan ve un remoto parcial y trata los docs no
+    // vistos como borrados (del-local) → pérdida de datos y pull roto.
+    const remoteByPath = new Map();
+    let cursor = null;
+    let pages = 0;
+    const MAX_PAGES = 1000; // 1000 × 2000 = 2M docs, tope de seguridad anti-loop.
+    do {
+        const url = new URL(`${HUB_URL}/api/sync/worker-list`);
+        url.searchParams.set('workspaceId', token);
+        if (cursor) url.searchParams.set('cursor', cursor);
+        const data = await fetchJson(url.toString(), { headers: authHeaders(token) });
+        if (!Array.isArray(data.items)) { log(wsId, 'respuesta inesperada'); return; }
+        for (const i of data.items) remoteByPath.set(i.repoPath, i);
+        cursor = typeof data.nextCursor === 'string' && data.nextCursor ? data.nextCursor : null;
+    } while (cursor && ++pages < MAX_PAGES);
+    if (cursor) {
+        // No agotamos la paginación: el remoto está incompleto. Abortar el ciclo
+        // ANTES de buildPlan para no disparar del-local sobre los docs no vistos.
+        log(wsId, `worker-list excedió ${MAX_PAGES} páginas — abortando ciclo (remoto incompleto)`);
+        return;
+    }
 
     const localByPath = await walkLocal(wsDir);
     const rawState = await readState(wsDir);
