@@ -25,7 +25,7 @@ import { MetricsRegistry, percentile } from './metrics.mjs';
 const HUB_URL = process.env.AGORA_HUB_URL ?? process.env.NEXUS_URL ?? 'https://agora-backend-578238159459.us-central1.run.app';
 const WORKER_SECRET = process.env.WORKER_SYNC_SECRET || process.env.WORKER_SECRET;
 const BASE_DIR = process.env.BASE_DIR ?? '/home/stev/edu-worker/workspaces';
-const POLL_MS = Number.parseInt(process.env.POLL_MS ?? '5000', 10);
+const POLL_MS = Number.parseInt(process.env.POLL_MS ?? '30000', 10);
 const VERBOSE = process.env.VERBOSE === '1';
 const CONCURRENCY = Number.parseInt(process.env.CONCURRENCY ?? '4', 10);
 const SYNC_CONCURRENCY = Number.parseInt(process.env.SYNC_CONCURRENCY ?? '8', 10);
@@ -192,6 +192,11 @@ const readState = async (wsDir) => {
 };
 const writeState = async (wsDir, state) =>
     writeFile(path.join(wsDir, '.agora-host-sync.json'), JSON.stringify(state, null, 2));
+
+// Último timestamp de sincronización exitosa por workspace (para el parámetro
+// `since=` en worker-list). Reduce lecturas Firestore al filtrar sólo docs
+// modificados después del último ciclo completado.
+const lastSyncMs = new Map();
 
 // Circuit breaker: tras N fallos consecutivos del mismo path o workspace,
 // dejar de intentar y solo loggear cada 30 ciclos. Evita inundar el log con
@@ -479,17 +484,38 @@ const syncOne = async (wsId) => {
     // en la web fuera de la primera página. Hay que seguir `nextCursor` hasta
     // agotar la lista, o el plan ve un remoto parcial y trata los docs no
     // vistos como borrados (del-local) → pérdida de datos y pull roto.
+    //
+    // `since=<unixMs>` le pide al servidor sólo los docs con updatedAt > since.
+    // En el primer ciclo (sin valor previo) se envía since=0 equivalente a full
+    // scan. Tras un ciclo exitoso se guarda el máximo updatedAt visto para que
+    // los ciclos siguientes sólo lean lo nuevo — reducción drástica de Firestore
+    // reads en workspaces estables.
+    const sinceMs = lastSyncMs.get(wsId) ?? 0;
     const remoteByPath = new Map();
     let cursor = null;
     let pages = 0;
+    let maxUpdatedAt = sinceMs; // acumula el máximo updatedAt de los items recibidos
     const MAX_PAGES = 1000; // 1000 × 2000 = 2M docs, tope de seguridad anti-loop.
     do {
         const url = new URL(`${HUB_URL}/api/sync/worker-list`);
         url.searchParams.set('workspaceId', token);
+        url.searchParams.set('since', String(sinceMs));
         if (cursor) url.searchParams.set('cursor', cursor);
+        verbose(`  worker-list fetch ${wsId} since=${sinceMs}${cursor ? ` cursor=${cursor.slice(0,8)}…` : ''}`);
         const data = await fetchJson(url.toString(), { headers: authHeaders(token) });
         if (!Array.isArray(data.items)) { log(wsId, 'respuesta inesperada'); return; }
-        for (const i of data.items) remoteByPath.set(i.repoPath, i);
+        for (const i of data.items) {
+            remoteByPath.set(i.repoPath, i);
+            // `updatedAt` puede venir como número unix ms o como Firestore Timestamp
+            // serializado como objeto `{ _seconds, _nanoseconds }` o string ISO.
+            if (i.updatedAt) {
+                let ts = 0;
+                if (typeof i.updatedAt === 'number') ts = i.updatedAt;
+                else if (typeof i.updatedAt === 'string') ts = new Date(i.updatedAt).getTime();
+                else if (i.updatedAt._seconds) ts = i.updatedAt._seconds * 1000;
+                if (ts > maxUpdatedAt) maxUpdatedAt = ts;
+            }
+        }
         cursor = typeof data.nextCursor === 'string' && data.nextCursor ? data.nextCursor : null;
     } while (cursor && ++pages < MAX_PAGES);
     if (cursor) {
@@ -498,6 +524,10 @@ const syncOne = async (wsId) => {
         log(wsId, `worker-list excedió ${MAX_PAGES} páginas — abortando ciclo (remoto incompleto)`);
         return;
     }
+    // Actualizar lastSyncMs para el próximo ciclo. Si no recibimos ningún item
+    // (workspace sin cambios desde `sinceMs`) usamos Date.now() para avanzar la
+    // ventana igualmente.
+    lastSyncMs.set(wsId, maxUpdatedAt > sinceMs ? maxUpdatedAt : Date.now());
 
     const localByPath = await walkLocal(wsDir);
     const rawState = await readState(wsDir);
