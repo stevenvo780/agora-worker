@@ -310,7 +310,7 @@ const pushFile = async (token, repoPath, info) => {
  * estado local, remoto y tracked. La ejecución posterior corre en paralelo
  * con `runPool(SYNC_CONCURRENCY)`.
  */
-const buildPlan = (allPaths, localByPath, remoteByPath, state, isIgnored) => {
+const buildPlan = (allPaths, localByPath, remoteByPath, state, isIgnored, incremental = false) => {
     const ops = [];
     for (const safe of allPaths) {
         if (isHardSkipped(safe)) { ops.push({ kind: 'skip', path: safe, reason: 'hard' }); continue; }
@@ -338,7 +338,7 @@ const buildPlan = (allPaths, localByPath, remoteByPath, state, isIgnored) => {
             continue;
         }
 
-        if (remoteDeleted && local) {
+        if (remoteDeleted && local && !incremental) {
             ops.push({ kind: 'del-local', path: safe });
             continue;
         }
@@ -549,7 +549,7 @@ const syncOne = async (wsId) => {
         ...Object.keys(state)
     ]);
 
-    const ops = buildPlan(allPaths, localByPath, remoteByPath, state, isIgnored);
+    const ops = buildPlan(allPaths, localByPath, remoteByPath, state, isIgnored, sinceMs > 0);
     queueDepth.set({ wsId }, ops.length);
 
     const ctx = {
