@@ -29,6 +29,10 @@ const POLL_MS = Number.parseInt(process.env.POLL_MS ?? '30000', 10);
 const VERBOSE = process.env.VERBOSE === '1';
 const CONCURRENCY = Number.parseInt(process.env.CONCURRENCY ?? '4', 10);
 const SYNC_CONCURRENCY = Number.parseInt(process.env.SYNC_CONCURRENCY ?? '8', 10);
+// Cada cuántos ciclos por workspace se fuerza un scan completo (since=0). Es lo
+// que permite detectar borrados hechos en la web: del-local sólo corre en full
+// scan (ver syncOne). Sin esto, un delete remoto nunca se propaga al worker.
+const FULL_RECONCILE_EVERY = Number.parseInt(process.env.FULL_RECONCILE_EVERY ?? '5', 10);
 const METRICS_PORT = Number.parseInt(process.env.METRICS_PORT ?? '9090', 10);
 const METRICS_BIND = process.env.METRICS_BIND ?? '127.0.0.1';
 const METRICS_DISABLED = process.env.METRICS_DISABLED === '1';
@@ -197,6 +201,7 @@ const writeState = async (wsDir, state) =>
 // `since=` en worker-list). Reduce lecturas Firestore al filtrar sólo docs
 // modificados después del último ciclo completado.
 const lastSyncMs = new Map();
+const reconcileCounter = new Map();
 
 // Circuit breaker: tras N fallos consecutivos del mismo path o workspace,
 // dejar de intentar y solo loggear cada 30 ciclos. Evita inundar el log con
@@ -490,7 +495,17 @@ const syncOne = async (wsId) => {
     // scan. Tras un ciclo exitoso se guarda el máximo updatedAt visto para que
     // los ciclos siguientes sólo lean lo nuevo — reducción drástica de Firestore
     // reads en workspaces estables.
-    const sinceMs = lastSyncMs.get(wsId) ?? 0;
+    // del-local sólo es seguro en scan completo (since=0): ahí remoteByPath tiene
+    // TODOS los docs, así que la ausencia de un path = borrado real en la web. En
+    // incremental (since>0) worker-list trae sólo lo nuevo, por lo que la ausencia
+    // NO implica borrado. Por eso forzamos un full-reconcile cada FULL_RECONCILE_EVERY
+    // ciclos: sin esto un borrado en la web nunca se propaga al worker (sólo en el
+    // primer ciclo post-arranque). La paginación incompleta sigue abortando antes de
+    // buildPlan (más abajo), así que el full-scan nunca dispara del-local sobre remoto parcial.
+    const reconcileN = reconcileCounter.get(wsId) ?? 0;
+    reconcileCounter.set(wsId, reconcileN + 1);
+    const fullReconcile = reconcileN % FULL_RECONCILE_EVERY === 0;
+    const sinceMs = fullReconcile ? 0 : (lastSyncMs.get(wsId) ?? 0);
     const remoteByPath = new Map();
     let cursor = null;
     let pages = 0;
