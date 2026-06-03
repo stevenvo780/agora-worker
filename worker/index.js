@@ -347,7 +347,10 @@ socket.on('execute', (data) => {
             return;
         }
         const isPrintable = code >= 0x20 && code <= 0x7e;
-        const isAllowedControl = code === 0x09 || code === 0x0a || code === 0x0d || code === 0x08 || code === 0x03 || code === 0x04 || code === 0x1b;
+        // Controles C0 (0x01-0x1f) + DEL (0x7f) son entrada normal de terminal.
+        // El Backspace de xterm.js viaja como 0x7f (DEL), no 0x08; sin esto el
+        // PTY descarta cada borrado. También cubre Ctrl-C/D/U/W, flechas (ESC), etc.
+        const isAllowedControl = (code >= 0x01 && code <= 0x1f) || code === 0x7f;
         if (!isPrintable && !isAllowedControl && code < 0x80) {
             console.warn(`[worker] execute input contains forbidden control byte 0x${code.toString(16)} for session ${sessionId}, ignoring`);
             return;
