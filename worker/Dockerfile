@@ -140,6 +140,7 @@ RUN cd /opt/agora-cli && npm install --omit=dev --no-audit --no-fund && npm link
 COPY index.js .
 COPY agent-command-policy.mjs .
 COPY worker-token.mjs .
+COPY fetch-git-creds.mjs .
 COPY entrypoint.sh .
 
 # Clean up any stale serviceAccountKey.json directory from cache
@@ -150,6 +151,8 @@ RUN chmod +x entrypoint.sh
 
 # Environment defaults
 ENV NEXUS_URL=http://localhost:3010
+# Backend (Cloud Run) para pedir credenciales git Forgejo al boot. Overridable.
+ENV AGORA_BACKEND_URL=https://agora-backend-578238159459.us-central1.run.app
 # WORKER_TOKEN must be provided at runtime (e.g., personal:<uid> or shared:<workspace-id>)
 
 # Run as non-root to keep workspace file ownership aligned with host user

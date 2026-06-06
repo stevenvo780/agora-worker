@@ -269,43 +269,40 @@ else
     echo "   Workspace ID: $WORKER_TOKEN"
 fi
 
-# ── Git workspace bootstrap (no destructivo) ────────────────────
-# Backend = Forgejo (1 repo por workspace) + MinIO. Cada workspace = 1 repo.
-# Si el contenedor recibe AGORA_WORKSPACE_REPO + AGORA_GIT_USER + AGORA_GIT_TOKEN,
-# fusiona /workspace local con el remoto sin perder archivos preexistentes.
+# ── Git workspace bootstrap (Forgejo on-demand, no destructivo) ──
+# El sync CONTINUO de /workspace lo hace el daemon agora-host-sync (MinIO). Este
+# bloque sólo deja el remote Forgejo configurado y autenticado para que el
+# usuario/agente haga `git pull`/`push` cuando quiera. NO corre un watcher en
+# paralelo (eso competía con el daemon y causaba carreras de doble-sync).
+#
+# Si las credenciales no llegan por env, se piden al backend (auth HMAC worker).
+if [ -z "${AGORA_WORKSPACE_REPO:-}" ]; then
+    node /app/fetch-git-creds.mjs 2>/dev/null || true
+    if [ -f /tmp/agora-git-creds.env ]; then
+        set -a; . /tmp/agora-git-creds.env; set +a
+        rm -f /tmp/agora-git-creds.env
+    fi
+fi
+
 if [ -n "${AGORA_WORKSPACE_REPO:-}" ] && [ -n "${AGORA_GIT_USER:-}" ] && [ -n "${AGORA_GIT_TOKEN:-}" ]; then
-    echo "🌿 Configurando workspace git..."
+    echo "🌿 Configurando remote Forgejo (on-demand)..."
     AUTHED_URL=$(echo "$AGORA_WORKSPACE_REPO" | sed -E "s#https?://#https://${AGORA_GIT_USER}:${AGORA_GIT_TOKEN}@#")
+    if [ ! -d "${WORKSPACE_DIR}/.git" ]; then
+        git -C "${WORKSPACE_DIR}" init -q -b main
+    fi
     git -C "${WORKSPACE_DIR}" config user.email "${AGORA_GIT_EMAIL:-${AGORA_GIT_USER}@noreply.agora.local}" || true
     git -C "${WORKSPACE_DIR}" config user.name  "${AGORA_GIT_USER}" || true
-
-    if [ ! -d "${WORKSPACE_DIR}/.git" ]; then
-        # No es repo todavía. Si hay archivos pre-existentes los preservamos:
-        # init local + add + commit, luego pull --rebase contra remoto.
-        echo "   inicializando repo local sobre /workspace existente..."
-        git -C "${WORKSPACE_DIR}" init -q -b main
-        git -C "${WORKSPACE_DIR}" remote add origin "$AUTHED_URL"
-        # Si hay archivos los committeamos primero para no perderlos.
-        if [ -n "$(ls -A "${WORKSPACE_DIR}" 2>/dev/null | grep -v '^\.git$' || true)" ]; then
-            git -C "${WORKSPACE_DIR}" add -A 2>/dev/null || true
-            git -C "${WORKSPACE_DIR}" commit -m "preexisting workspace at first boot" --allow-empty 2>/dev/null || true
-        else
-            git -C "${WORKSPACE_DIR}" commit --allow-empty -m "init" 2>/dev/null || true
-        fi
-        # Fusionar con remoto sin sobrescribir
-        git -C "${WORKSPACE_DIR}" fetch origin --quiet 2>/dev/null || true
-        git -C "${WORKSPACE_DIR}" pull --rebase --strategy=recursive --strategy-option=ours origin main --no-edit 2>/dev/null || true
-        git -C "${WORKSPACE_DIR}" push -u origin main 2>/dev/null || true
-    else
+    if git -C "${WORKSPACE_DIR}" remote get-url origin >/dev/null 2>&1; then
         git -C "${WORKSPACE_DIR}" remote set-url origin "$AUTHED_URL"
-        git -C "${WORKSPACE_DIR}" pull --rebase --autostash --quiet 2>/dev/null || true
+    else
+        git -C "${WORKSPACE_DIR}" remote add origin "$AUTHED_URL"
     fi
-
-    # Auto-sync con NAS via agora-cli (pull + autocommit + push cada 30s).
-    nohup agora watch "${WORKSPACE_DIR}" >/tmp/agora-watch.log 2>&1 &
-    echo "✅ Git workspace listo (origin: ${AGORA_WORKSPACE_REPO}); agora-cli watch corriendo."
+    # Sólo traer refs: NO toca el working tree, así no compite con el daemon MinIO.
+    git -C "${WORKSPACE_DIR}" fetch origin --quiet 2>/dev/null || true
+    echo "✅ Remote Forgejo listo (origin: ${AGORA_WORKSPACE_REPO})."
+    echo "   Usá: git pull origin main / git push origin main, o el CLI 'agora'."
 else
-    echo "ℹ️  AGORA_WORKSPACE_REPO/USER/TOKEN no definidos; saltando bootstrap git (workspace local intacto)."
+    echo "ℹ️  Sin credenciales Forgejo; el worker sincroniza vía el daemon (git on-demand off)."
 fi
 
 # Start main Worker process
