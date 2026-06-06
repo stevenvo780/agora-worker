@@ -62,11 +62,22 @@ const run = (cmd, args, opts = {}) => new Promise((resolve, reject) => {
   child.on('error', reject);
 });
 
+const capture = (cmd, args, opts = {}) => new Promise((resolve, reject) => {
+  const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+  child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+  child.on('exit', (code) => code === 0 ? resolve(stdout) : reject(new Error(stderr.trim() || `${cmd} exited with ${code}`)));
+  child.on('error', reject);
+});
+
 const cmdLogin = async () => {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
-    const apiUrlIn = await rl.question('URL del API de Agora (ej: https://agora.humanizar-dev.cloud): ');
-    const apiUrl = apiUrlIn.trim().replace(/\/$/, '');
+    const DEFAULT_API_URL = process.env.AGORA_API_URL || 'https://agora.elenxos.com';
+    const apiUrlIn = await rl.question(`URL del API de Agora [${DEFAULT_API_URL}]: `);
+    const apiUrl = (apiUrlIn.trim() || DEFAULT_API_URL).replace(/\/$/, '');
     if (!apiUrl) errExit('apiUrl requerida');
 
     log(`\nAbre en tu navegador: ${apiUrl}/login?cli=1`);
@@ -102,6 +113,24 @@ const cmdWorkspaces = async () => {
     const name = w.name ?? '(sin nombre)';
     const type = w.type ?? '?';
     log(`${id}\t${type}\t${name}`);
+  }
+};
+
+const cmdStatus = async (dir) => {
+  const cfg = await readConfig();
+  log(`API: ${cfg.apiUrl || '(sin login)'}`);
+  log(`Usuario: ${cfg.email || cfg.uid || '(sin login)'}`);
+
+  const target = path.resolve(dir || '.');
+  log(`Directorio: ${target}`);
+  try {
+    const workspaceId = (await capture('git', ['-C', target, 'config', '--get', 'agora.workspaceId'])).trim();
+    const apiUrl = (await capture('git', ['-C', target, 'config', '--get', 'agora.apiUrl']).catch(() => '')).trim();
+    log(`Workspace: ${workspaceId || '(no configurado)'}`);
+    if (apiUrl) log(`Workspace API: ${apiUrl}`);
+    await run('git', ['-C', target, 'status', '--short', '--branch']);
+  } catch {
+    log('Workspace: (este directorio no parece un workspace Agora inicializado)');
   }
 };
 
@@ -141,19 +170,25 @@ const cmdClone = async (workspaceId, dir) => {
 const cmdInit = async (dir) => {
   if (!dir) errExit('Uso: agora init <dir>');
   const target = path.resolve(dir);
+  await fsp.mkdir(target, { recursive: true });
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
     const wsId = (await rl.question('workspaceId al que apuntar este dir: ')).trim();
+    if (!wsId) errExit('workspaceId requerido');
     const cfg = await readConfig();
     const info = await ensureRepoUrl(cfg, wsId);
     if (!fs.existsSync(path.join(target, '.git'))) {
       await run('git', ['-C', target, 'init', '-b', 'main']);
     }
-    await run('git', ['-C', target, 'remote', 'add', 'origin', info.cloneUrl]).catch(async () => {
+    // Forzar la URL: si remote ya existe con otra URL, set-url la actualiza.
+    try {
+      await run('git', ['-C', target, 'remote', 'add', 'origin', info.cloneUrl]);
+    } catch {
       await run('git', ['-C', target, 'remote', 'set-url', 'origin', info.cloneUrl]);
-    });
+    }
     await run('git', ['-C', target, 'config', 'agora.workspaceId', wsId]);
     log(`✅ ${target} apunta a ${info.repoFullName}`);
+    log(`   Próximo paso: agora pull ${target}`);
   } finally { rl.close(); }
 };
 
@@ -171,24 +206,14 @@ const cmdPush = async (dir, args) => {
   const target = path.resolve(dir || '.');
   const msg = parseMessage(args) || `Update ${new Date().toISOString()}`;
   await run('git', ['-C', target, 'add', '-A']);
-  // Solo commit si hay cambios:
-  await new Promise((resolve) => {
+  const hasChanges = await new Promise((resolve, reject) => {
     const c = spawn('git', ['-C', target, 'diff', '--cached', '--quiet']);
-    c.on('exit', async (code) => {
-      if (code === 0) {
-        log('No hay cambios.');
-        resolve();
-        return;
-      }
-      try {
-        await run('git', ['-C', target, 'commit', '-m', msg]);
-        await run('git', ['-C', target, 'push']);
-      } catch (e) {
-        console.error(e.message);
-      }
-      resolve();
-    });
+    c.on('error', reject);
+    c.on('exit', (code) => resolve(code !== 0));
   });
+  if (!hasChanges) { log('No hay cambios.'); return; }
+  await run('git', ['-C', target, 'commit', '-m', msg]);
+  await run('git', ['-C', target, 'push']);
 };
 
 const cmdWatch = async (dir) => {
@@ -197,14 +222,12 @@ const cmdWatch = async (dir) => {
   const tick = async () => {
     try { await run('git', ['-C', target, 'pull', '--rebase', '--autostash', '--quiet']); } catch { /* noop */ }
     try {
-      const c = spawn('git', ['-C', target, 'diff', '--quiet']);
-      c.on('exit', async (code) => {
-        if (code !== 0) {
-          await run('git', ['-C', target, 'add', '-A']);
-          await run('git', ['-C', target, 'commit', '-m', `agora-watch ${new Date().toISOString()}`]).catch(() => undefined);
-          await run('git', ['-C', target, 'push']).catch(() => undefined);
-        }
-      });
+      const porcelain = await capture('git', ['-C', target, 'status', '--porcelain']);
+      if (porcelain.trim()) {
+        await run('git', ['-C', target, 'add', '-u']);
+        await run('git', ['-C', target, 'commit', '-m', `agora-watch ${new Date().toISOString()}`]).catch(() => undefined);
+        await run('git', ['-C', target, 'push']).catch(() => undefined);
+      }
     } catch { /* noop */ }
   };
   setInterval(tick, 30_000);
@@ -217,6 +240,7 @@ const help = () => {
 Uso:
   agora login                       Login con Firebase ID token.
   agora logout                      Borra credenciales locales.
+  agora status [dir]                Muestra login y estado git del workspace.
   agora workspaces                  Lista tus workspaces.
   agora clone <wsId> [dir]          Clona el repo del workspace.
   agora init <dir>                  Convierte un dir existente en workspace.
@@ -233,6 +257,7 @@ const main = async () => {
   switch (cmd) {
     case 'login': return cmdLogin();
     case 'logout': return cmdLogout();
+    case 'status': return cmdStatus(args[0]);
     case 'workspaces': case 'ls': return cmdWorkspaces();
     case 'clone': return cmdClone(args[0], args[1]);
     case 'init': return cmdInit(args[0]);
