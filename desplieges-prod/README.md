@@ -14,15 +14,15 @@ Este `README` queda como chuleta rápida de comandos.
 
 | Campo | Valor |
 |---|---|
-| Alias SSH | `stev-server` |
-| IP NetBird | `100.98.8.227` |
-| Usuario | `stev` |
-| Rol | Hub + workers |
+| Alias SSH | `ils-server` |
+| IP NetBird | `100.98.245.50` |
+| Usuario | `humanizar` |
+| Rol | Workers (43 edu-worker-*) |
 
 Acceso:
 
 ```bash
-ssh stev-server
+ssh ils-server
 ```
 
 ---
@@ -50,10 +50,10 @@ vercel --prod
 Con versión explícita de ST:
 
 ```bash
-./desplieges-prod/deploy_docker.sh 3.2.1
+./desplieges-prod/deploy_docker.sh 4.15.1
 ```
 
-> El script construye la imagen con `ST_LANG_VERSION` explícita (si se la pasas), la publica y luego ejecuta `edu-worker-manager update all` en `stev-server`. Si `sudo` remoto requiere contraseña, la pedirá en la terminal o puede recibirse por variable de entorno sin dejarla hardcodeada en el repo.
+> El script construye la imagen con `ST_LANG_VERSION` explícita (si se la pasas), la publica y luego ejecuta `edu-worker-manager update all` en `ils-server`. Si `sudo` remoto requiere contraseña, la pedirá en la terminal o puede recibirse por variable de entorno sin dejarla hardcodeada en el repo.
 
 ### 4. Worker — `.deb` del manager + update all
 
@@ -64,7 +64,7 @@ Con versión explícita de ST:
 ### 5. Hotfix de emergencia de ST dentro de contenedores vivos
 
 ```bash
-ALLOW_INPLACE_ST_UPDATE=1 ./desplieges-prod/update_st_workers.sh 3.2.1
+ALLOW_INPLACE_ST_UPDATE=1 ./desplieges-prod/update_st_workers.sh 4.15.1
 ```
 
 > Solo para contingencia. No sustituye el rebuild de imagen.
@@ -78,21 +78,21 @@ ALLOW_INPLACE_ST_UPDATE=1 ./desplieges-prod/update_st_workers.sh 3.2.1
 
 - Archivo: `/etc/edu-worker/worker.env`
 - Variables mínimas:
-  - `NEXUS_URL=https://hub.humanizar-dev.cloud`
+  - `NEXUS_URL=https://hub.elenxos.com`
   - `WORKER_SOCKET_SECRET` (debe coincidir con Hub)
   - `WORKER_SYNC_SECRET` (debe coincidir con AgoraBack/host-sync)
   - `FIREBASE_CONFIG` con `projectId`, `storageBucket`, `databaseURL`
 
 ### Hub
 
-- Archivos / referencias operativas:
-  - `/home/stev/edu-hub/.env`
-  - `/home/stev/edu-hub/serviceAccountKey.json`
+- Archivos / referencias operativas (en agora-storage `root@76.13.118.239`):
+  - `/opt/edu-hub/.env`
+  - `/opt/edu-hub/serviceAccountKey.json`
 
 Regla obligatoria:
 
 ```bash
-grep -E 'WORKER_SOCKET_SECRET|WORKER_SECRET_PREVIOUS|WORKER_SECRET' /home/stev/edu-hub/.env
+grep -E 'WORKER_SOCKET_SECRET|WORKER_SECRET_PREVIOUS|WORKER_SECRET' /opt/edu-hub/.env
 grep -E 'NEXUS_URL|WORKER_SOCKET_SECRET|WORKER_SYNC_SECRET|WORKER_SECRET_PREVIOUS|WORKER_SECRET' /etc/edu-worker/worker.env
 ```
 
@@ -101,11 +101,13 @@ grep -E 'NEXUS_URL|WORKER_SOCKET_SECRET|WORKER_SYNC_SECRET|WORKER_SECRET_PREVIOU
 ## Verificaciones mínimas
 
 ```bash
-ssh stev-server
-systemctl --user status edu-hub
+ssh ils-server
 sudo edu-worker-manager status
 sudo docker ps --filter name=edu-worker
 sudo docker exec $(sudo docker ps --filter name=edu-worker --format '{{.Names}}' | head -n 1) st --version
+# Hub (en agora-storage):
+ssh root@76.13.118.239 'systemctl status edu-hub'
+curl -s https://hub.elenxos.com/health
 ```
 
 ---

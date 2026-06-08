@@ -10,7 +10,7 @@ set -euo pipefail
 #   WORKER_SECRET=<secret> ./install-worker.sh <workspaceId>
 #
 # Variables opcionales:
-#   NEXUS_URL     URL de AgoraHub (default: https://hub.humanizar-dev.cloud)
+#   NEXUS_URL     URL de AgoraHub (default: https://hub.elenxos.com)
 #   WORKER_TOKEN  Token del worker (default: <workspaceId>)
 
 # Detect distro
@@ -84,13 +84,13 @@ echo "==> Engine detectado/instalado: $CONTAINER_CMD"
 
 # Required args
 WSID="${1:-}"
-NEXUS_URL="${NEXUS_URL:-https://hub.humanizar-dev.cloud}"
+NEXUS_URL="${NEXUS_URL:-https://hub.elenxos.com}"
 WORKER_TOKEN="${WORKER_TOKEN:-$WSID}"
 WORKER_SECRET="${WORKER_SECRET:-}"
 
 if [ -z "$WSID" ] || [ -z "$WORKER_SECRET" ]; then
   echo "Uso: WORKER_SECRET=<secret> ./install-worker.sh <workspaceId>" >&2
-  echo "  NEXUS_URL opcional (default: https://hub.humanizar-dev.cloud)" >&2
+  echo "  NEXUS_URL opcional (default: https://hub.elenxos.com)" >&2
   exit 1
 fi
 

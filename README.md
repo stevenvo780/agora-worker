@@ -1,8 +1,8 @@
 # AgoraWorker
 
 Runtime de workers por workspace y daemon host-sync. En producción
-corren ~35 containers `edu-worker-<wsId>` en `humanizar2` (host activo).
-Todos apuntan al hub vía `NEXUS_URL=https://hub.humanizar-dev.cloud`.
+corren ~43 containers `edu-worker-<wsId>` en `ils-server` (host activo).
+Todos apuntan al hub vía `NEXUS_URL=https://hub.elenxos.com`.
 
 > **Operación / restart / docker daemon crashes**: ver [`../RUNBOOK_OPS.md §3, §12`](../RUNBOOK_OPS.md).
 > **Detalle arquitectura/secrets**: `../CLAUDE.md` (raíz workspace).
@@ -60,8 +60,8 @@ cd worker
 docker build -t stevenvo780/edu-worker:latest .
 docker push stevenvo780/edu-worker:latest
 
-# Recrear los ~27 containers con la imagen nueva
-ssh nas 'ssh humanizar2 "echo PASS | sudo -S edu-worker-manager update all"'
+# Recrear los ~43 containers con la imagen nueva
+ssh ils-server 'echo PASS | sudo -S edu-worker-manager update all'
 ```
 
 ### Daemon agora-host-sync
@@ -93,7 +93,7 @@ Detecta `docker`/`podman` ya instalados. Si no hay ninguno: instala Podman en Fe
 sudo dnf install -y podman
 podman pull stevenvo780/edu-worker:latest
 podman run -d --name edu-worker-<wsId> --restart=unless-stopped --network=host \
-  -e NEXUS_URL=https://hub.humanizar-dev.cloud \
+  -e NEXUS_URL=https://hub.elenxos.com \
   -e WORKER_TOKEN=<wsId> \
   -e WORKER_SECRET=<secret> \
   stevenvo780/edu-worker:latest

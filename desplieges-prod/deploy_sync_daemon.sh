@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Deploy idempotente de agora-host-sync a humanizar2 (host de workers).
+# Deploy idempotente de agora-host-sync a ils-server (host de workers).
 #
 # Uso:
 #   SUDO_PASS=<pass> ./deploy_sync_daemon.sh [host]
 #
 # Variables:
-#   HOST       — destino SSH (default: humanizar2)
+#   HOST       — destino SSH (default: ils-server)
 #   SUDO_PASS  — password sudo del host (requerido)
 #
 # El script:
@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-HOST="${1:-humanizar2}"
+HOST="${1:-ils-server}"
 SUDO_PASS="${SUDO_PASS:?env SUDO_PASS required}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_DIR="$(cd "${SCRIPT_DIR}/../worker-host-sync" && pwd)"

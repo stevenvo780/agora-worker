@@ -1,17 +1,15 @@
 #!/bin/bash
-# Deploy AgoraHub to GCP VM agora-hub (post-split, 2026-05)
-# Contexto: hub vive en AgoraHub/ (peer dir). VM agora-hub en us-central1-a.
+# Deploy AgoraHub to Hostinger VPS agora-storage (post-migración GCP→Hostinger, 2026-05)
+# Contexto: hub vive en AgoraHub/ (peer dir). VPS agora-storage: root@76.13.118.239.
 # Systemd unit edu-hub.service, usuario no-root edu-hub, ProtectSystem.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AGORA_HUB_DIR="$(cd "${SCRIPT_DIR}/../../AgoraHub" && pwd)"
-GCP_VM="agora-hub"
-GCP_ZONE="${GCP_ZONE:-us-central1-a}"
-GCP_PROJECT="${GCP_PROJECT:-udea-filosofia}"
+REMOTE_HOST="${HUB_HOST:-root@76.13.118.239}"
 REMOTE_TMP="/tmp/edu-hub-new-index.js"
 REMOTE_DEST="/opt/edu-hub/dist/index.js"
-HEALTH_URL="https://hub.humanizar-dev.cloud/health"
+HEALTH_URL="https://hub.elenxos.com/health"
 
 echo "==> AgoraHub dir: ${AGORA_HUB_DIR}"
 
@@ -28,24 +26,21 @@ if [[ ! -f "${LOCAL_ARTIFACT}" ]]; then
 fi
 echo "==> Build OK: ${LOCAL_ARTIFACT}"
 
-# 2. Subir artefacto a /tmp de la VM (sin necesitar root en destino)
-echo "==> Subiendo dist/index.js a ${GCP_VM}:${REMOTE_TMP}..."
-gcloud compute scp "${LOCAL_ARTIFACT}" "${GCP_VM}:${REMOTE_TMP}" \
-  --zone="${GCP_ZONE}" --project="${GCP_PROJECT}"
+# 2. Subir artefacto a /tmp del VPS (sin necesitar root en destino)
+echo "==> Subiendo dist/index.js a ${REMOTE_HOST}:${REMOTE_TMP}..."
+scp "${LOCAL_ARTIFACT}" "${REMOTE_HOST}:${REMOTE_TMP}"
 echo "==> scp OK"
 
 # 3. Mover al destino final con permisos correctos y reiniciar el servicio
-echo "==> Instalando en VM y reiniciando edu-hub.service..."
-gcloud compute ssh "${GCP_VM}" \
-  --zone="${GCP_ZONE}" --project="${GCP_PROJECT}" \
-  --command="
+echo "==> Instalando en VPS y reiniciando edu-hub.service..."
+ssh "${REMOTE_HOST}" "
     set -euo pipefail
-    sudo cp '${REMOTE_TMP}' '${REMOTE_DEST}'
-    sudo chown edu-hub:edu-hub '${REMOTE_DEST}'
-    sudo chmod 644 '${REMOTE_DEST}'
+    cp '${REMOTE_TMP}' '${REMOTE_DEST}'
+    chown edu-hub:edu-hub '${REMOTE_DEST}'
+    chmod 644 '${REMOTE_DEST}'
     rm -f '${REMOTE_TMP}'
-    sudo systemctl restart edu-hub
-    sudo systemctl is-active edu-hub
+    systemctl restart edu-hub
+    systemctl is-active edu-hub
   "
 echo "==> Restart OK"
 

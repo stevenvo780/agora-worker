@@ -4,7 +4,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REMOTE_HOST="${WORKER_HOST:-stev@100.98.8.227}"
+REMOTE_HOST="${WORKER_HOST:-humanizar@100.98.245.50}"
 REMOTE_SUDO_PASS="${WORKER_SUDO_PASS:-}"
 WORKER_VERSION="${WORKER_VERSION:-$(python3 - <<'PY'
 import json

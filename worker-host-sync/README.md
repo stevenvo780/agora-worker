@@ -1,24 +1,24 @@
 # agora-host-sync
 
-Daemon que corre en el host de los workers (`humanizar2`, `100.98.5.11`, user `humanizar`).
+Daemon que corre en el host de los workers (`ils-server`, `100.98.245.50`, user `humanizar`).
 Por cada contenedor `edu-worker-*` corriendo:
 
 - Mantiene `/home/humanizar/edu-worker/workspaces/<wsId>/` espejado con la
   workspace en MinIO + AgoraBack (bidireccional).
 - Revive automáticamente cualquier contenedor `edu-worker-*` que esté
-  Exited (necesario porque Docker 28.2.2 crashea ocasionalmente con un
-  bug de HTTP/2 y deja los workers en `hasBeenManuallyStopped=true`).
+  Exited (Docker CE 29.5.2 en ils-server no presenta el bug de HTTP/2
+  que causaba crashes en Docker 28.2.2, pero el mecanismo de reviva sigue activo).
 - Lee el `WORKER_TOKEN` real de cada container vía `docker inspect` para
   resolver el token correcto de workspaces personales (`personal:<uid>`),
   en lugar de usar el `wsId` crudo que causaba 500 "Owner not resolvable".
 
-## Instalación en humanizar2
+## Instalación en ils-server
 
 ```bash
 # Como root:
-rsync -a --exclude=node_modules --exclude='.env*' worker-host-sync/ humanizar2:/opt/agora-host-sync/
-ssh humanizar2 "cd /opt/agora-host-sync && npm install --omit=dev"
-ssh humanizar2 "chown -R humanizar:humanizar /opt/agora-host-sync"
+rsync -a --exclude=node_modules --exclude='.env*' worker-host-sync/ ils-server:/opt/agora-host-sync/
+ssh ils-server "cd /opt/agora-host-sync && npm install --omit=dev"
+ssh ils-server "chown -R humanizar:humanizar /opt/agora-host-sync"
 
 # Copiar la unit y recargar systemd:
 sudo cp agora-host-sync.service /etc/systemd/system/
