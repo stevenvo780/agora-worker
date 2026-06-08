@@ -390,12 +390,38 @@ const killSession = (data) => {
 socket.on('end-session', killSession);
 socket.on('kill-session', killSession);
 
-socket.on('disconnect', () => {
-    console.log('🔌 Disconnected from Hub, cleaning up sessions...');
+// Grace ante cortes de red: NO matar los PTYs al desconectarse. Un parpadeo de
+// red dispara 'disconnect' y socket.io reconecta solo (reconnection:true). El
+// hub mantiene la sesión y la re-vincula al reconectar (grace + re-attach, ver
+// AgoraHub/src/sessions.ts). Solo matamos si NO reconectamos dentro de la
+// ventana de gracia — así un agente largo en la terminal sobrevive al corte.
+const PTY_GRACE_MS = parseInt(process.env.WORKER_PTY_GRACE_MS || '', 10) || 180000;
+let ptyGraceTimer = null;
+
+const killAllSessions = () => {
     for (const ptyProcess of sessions.values()) {
         ptyProcess.kill();
     }
     sessions.clear();
     SESSION_LAST_ACTIVITY.clear();
     SESSION_OUTPUT_BUDGET.clear();
+};
+
+socket.on('disconnect', () => {
+    if (sessions.size === 0) return;
+    console.log(`🔌 Disconnected from Hub — gracia ${PTY_GRACE_MS}ms antes de matar ${sessions.size} sesión(es)`);
+    if (ptyGraceTimer) clearTimeout(ptyGraceTimer);
+    ptyGraceTimer = setTimeout(() => {
+        console.log('💀 Gracia expirada sin reconexión — matando sesiones');
+        ptyGraceTimer = null;
+        killAllSessions();
+    }, PTY_GRACE_MS);
+});
+
+socket.on('connect', () => {
+    if (ptyGraceTimer) {
+        clearTimeout(ptyGraceTimer);
+        ptyGraceTimer = null;
+        console.log('🔁 Reconectado dentro de la gracia — sesiones preservadas');
+    }
 });
