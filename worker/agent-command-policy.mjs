@@ -9,6 +9,8 @@ export const ALLOWED_AGENT_BINARIES = new Set([
   // `binary "base64" no está en la whitelist`. Bug I-1 relacionado.
   'base64',
   'git',
+  // CLIs propios de Agora
+  'agora', 'st',
   'node', 'npm', 'pnpm', 'npx', 'yarn',
   'python', 'python3', 'pip', 'pip3',
   'curl', 'wget',

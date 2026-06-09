@@ -17,14 +17,28 @@ echo "   Token: ${WORKER_TOKEN:-<not set>}"
 SKEL_DIR="/etc/skel-estudiante"
 HOME_DIR="/home/estudiante"
 if [ -d "$SKEL_DIR" ]; then
-    for f in .bashrc .profile .bash_logout; do
+    for f in .bashrc .profile .bash_logout CLI-AGENTE.md; do
         if [ ! -f "${HOME_DIR}/${f}" ] && [ -f "${SKEL_DIR}/${f}" ]; then
             cp "${SKEL_DIR}/${f}" "${HOME_DIR}/${f}"
-            echo "   📋 Restored ${f} from skeleton"
+            echo "   Restored ${f} from skeleton"
         fi
     done
     # Also restore sudo_as_admin marker
     touch "${HOME_DIR}/.sudo_as_admin_successful" 2>/dev/null || true
+fi
+
+# ── Seed ~/.agora/config.json si no existe ──────────────────────────────────
+# Permite que `agora status` muestre la API configurada en vez de "(sin login)".
+# El agente o usuario completa el login con: agora login --token agora_pat_...
+# (PAT generado en Agora Settings → Acceso CLI).
+AGORA_CONFIG_DIR="${HOME_DIR}/.agora"
+AGORA_CONFIG_FILE="${AGORA_CONFIG_DIR}/config.json"
+if [ ! -f "${AGORA_CONFIG_FILE}" ] && [ -n "${AGORA_BACKEND_URL:-}" ]; then
+    mkdir -p "${AGORA_CONFIG_DIR}"
+    chmod 700 "${AGORA_CONFIG_DIR}"
+    printf '{\n  "apiUrl": "%s"\n}\n' "${AGORA_BACKEND_URL}" > "${AGORA_CONFIG_FILE}"
+    chmod 600 "${AGORA_CONFIG_FILE}"
+    echo "   Seeded ~/.agora/config.json (apiUrl: ${AGORA_BACKEND_URL})"
 fi
 
 # ── Create default .syncignore and repos/ if missing ──────────────

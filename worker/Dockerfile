@@ -67,12 +67,6 @@ RUN mkdir -p /etc/apt/keyrings && \
     apt-get update && apt-get install -y nodejs && \
     rm -rf /var/lib/apt/lists/*
 
-ARG ST_LANG_VERSION=3.2.2
-ENV ST_LANG_VERSION=${ST_LANG_VERSION}
-
-# Vendored local build of ST so workers can ship the patched runtime
-COPY vendor/stevenvo780-st-lang-3.2.2.tgz /tmp/stevenvo780-st-lang.tgz
-
 # Install eza (modern ls replacement with colors + icons)
 RUN mkdir -p /etc/apt/keyrings && \
     wget -qO- https://raw.githubusercontent.com/eza-community/eza/main/deb.asc | gpg --dearmor -o /etc/apt/keyrings/gierens.gpg && \
@@ -81,6 +75,8 @@ RUN mkdir -p /etc/apt/keyrings && \
     rm -rf /var/lib/apt/lists/* || true
 
 # Install global npm packages
+# st-lang: runtime de lógica formal ST (multi-sistema, 52+ módulos, 6500+ tests)
+# st-cli:  CLI `st` — check/derive/countermodel/formalize/export/repl
 RUN npm install -g \
     pnpm \
     yarn \
@@ -89,7 +85,8 @@ RUN npm install -g \
     nodemon \
     live-server \
     http-server \
-    /tmp/stevenvo780-st-lang.tgz \
+    @stevenvo780/st-lang@latest \
+    @stevenvo780/st-cli@latest \
     @openai/codex \
     @anthropic-ai/claude-code \
     @google/gemini-cli
@@ -142,6 +139,10 @@ COPY agent-command-policy.mjs .
 COPY worker-token.mjs .
 COPY fetch-git-creds.mjs .
 COPY entrypoint.sh .
+
+# Guía de CLIs para el agente IA (disponible en /app/CLI-AGENTE.md y en el home)
+COPY CLI-AGENTE.md .
+RUN cp /app/CLI-AGENTE.md /etc/skel-estudiante/CLI-AGENTE.md 2>/dev/null || true
 
 # Clean up any stale serviceAccountKey.json directory from cache
 RUN rm -rf /app/serviceAccountKey.json 2>/dev/null || true
