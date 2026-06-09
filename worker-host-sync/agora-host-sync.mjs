@@ -149,7 +149,11 @@ const fetchJson = async (url, init = {}) => {
 
 const fetchBuf = async (url) => {
     const r = await fetch(url);
-    if (!r.ok) throw new Error(`download HTTP ${r.status}`);
+    if (!r.ok) {
+        const e = new Error(`download HTTP ${r.status}`);
+        e.httpStatus = r.status;
+        throw e;
+    }
     return Buffer.from(await r.arrayBuffer());
 };
 
@@ -209,6 +213,13 @@ const reconcileCounter = new Map();
 // Firestore pero el contenedor sigue corriendo).
 const FAIL_THRESHOLD = 3;
 const SILENCE_EVERY = 30;
+// Dead-letter: un pull con 404/410 (blob ausente en MinIO = doc huérfano) se
+// marca `dead` en el state para NO re-pullearlo en loop cada ciclo. Se re-intenta
+// tras DEAD_RETRY_MS por si el blob reaparece (reparado/re-subido). El GC del
+// backend (reconcile-storage) limpia el doc huérfano de Firestore; mientras tanto
+// el dead-letter evita el loop 404. Desactivable con DEADLETTER=0.
+const DEAD_LETTER = process.env.DEADLETTER !== '0';
+const DEAD_RETRY_MS = Number.parseInt(process.env.DEAD_RETRY_MS ?? '3600000', 10); // 1h
 const failCounter = new Map();
 const shouldFailLog = (key) => {
     const n = (failCounter.get(key) ?? 0) + 1;
@@ -337,6 +348,18 @@ const buildPlan = (allPaths, localByPath, remoteByPath, state, isIgnored, increm
 
         if (!local && !remote) { ops.push({ kind: 'forget', path: safe }); continue; }
 
+        // Dead-letter: path con blob 404 confirmado (doc huérfano). Sin local
+        // (un edit local va por push) y mientras el hash remoto no cambie y no
+        // venza la ventana de retry → skip, así no se re-pulea el 404 cada ciclo.
+        // Al vencer la ventana o cambiar el hash (blob reparado) → pull de nuevo.
+        if (tracked?.dead && remote && !local) {
+            const sameHash = remote.contentHash === trackedRemote;
+            const retryDue = (Date.now() - (tracked.deadAt || 0)) >= DEAD_RETRY_MS;
+            if (sameHash && !retryDue) { ops.push({ kind: 'skip', path: safe, reason: 'dead-letter' }); continue; }
+            ops.push({ kind: 'pull', path: safe, remote });
+            continue;
+        }
+
         // Server gana: cambio remoto (o archivo nuevo en NAS) → pull aunque haya cambio local.
         if (remoteChanged || (isFresh && remote && !local)) {
             ops.push({ kind: 'pull', path: safe, remote });
@@ -416,6 +439,11 @@ const executeOp = async (op, ctx) => {
             } catch (e) {
                 ctx.counts.failed++;
                 measure('pull', false);
+                // Dead-letter SOLO en 404/410 (blob confirmado ausente). NUNCA en
+                // 5xx/timeout/red (transitorio) — esos deben reintentarse normal.
+                if (DEAD_LETTER && (e.httpStatus === 404 || e.httpStatus === 410)) {
+                    state[safe] = { localHash: null, remoteHash: remote.contentHash, dead: true, deadAt: Date.now() };
+                }
                 if (shouldFailLog(`pull:${wsId}:${safe}`)) log('  pull fail', safe, e.message);
             }
             return;
