@@ -14,7 +14,7 @@
  */
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdir, writeFile, readFile, stat, readdir, rm } from 'node:fs/promises';
+import { mkdir, writeFile, readFile, stat, readdir, rm, copyFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import path from 'node:path';
 import { compileIgnore, isHardSkipped, isWorkspacePathIgnored, BUILTIN_IGNORE_RULES } from './ignore.mjs';
@@ -361,8 +361,11 @@ const buildPlan = (allPaths, localByPath, remoteByPath, state, isIgnored, increm
         }
 
         // Server gana: cambio remoto (o archivo nuevo en NAS) → pull aunque haya cambio local.
+        // Si ADEMÁS el local cambió (conflicto a 3 vías) marcamos conflict para
+        // respaldar el local antes de sobrescribirlo (en vez de perderlo en silencio).
         if (remoteChanged || (isFresh && remote && !local)) {
-            ops.push({ kind: 'pull', path: safe, remote });
+            const conflict = !!(local && localChanged);
+            ops.push({ kind: 'pull', path: safe, remote, conflict, local: conflict ? local : null });
             continue;
         }
 
@@ -428,6 +431,18 @@ const executeOp = async (op, ctx) => {
                 const buf = await fetchBuf(remote.signedUrl);
                 const fullPath = path.join(wsDir, safe);
                 await mkdir(path.dirname(fullPath), { recursive: true });
+                // Conflicto a 3 vías (local editado + remoto cambió): server gana,
+                // pero respaldamos el local en .agora-conflicts/ (HARD_SKIP, no
+                // sincroniza) para que el usuario no pierda su edición.
+                if (op.conflict) {
+                    try {
+                        const bdir = path.join(wsDir, '.agora-conflicts');
+                        await mkdir(bdir, { recursive: true });
+                        await copyFile(fullPath, path.join(bdir, `${safe.replace(/\//g, '__')}.${Date.now()}`));
+                        ctx.counts.conflicts = (ctx.counts.conflicts || 0) + 1;
+                        log('  ⚠ conflicto', safe, '→ local respaldado en .agora-conflicts/');
+                    } catch (be) { verbose('conflict backup fail', safe, be.message); }
+                }
                 await writeFile(fullPath, buf);
                 const newHash = sha256(buf);
                 state[safe] = { localHash: newHash, remoteHash: remote.contentHash };
@@ -597,7 +612,7 @@ const syncOne = async (wsId) => {
 
     const ctx = {
         wsId, token, wsDir, state,
-        counts: { downloaded: 0, uploaded: 0, skipped: 0, failed: 0, created: 0, purged: 0, deletedLocal: 0, deletedRemote: 0 },
+        counts: { downloaded: 0, uploaded: 0, skipped: 0, failed: 0, created: 0, purged: 0, deletedLocal: 0, deletedRemote: 0, conflicts: 0 },
         latencies: []
     };
 
@@ -605,7 +620,7 @@ const syncOne = async (wsId) => {
 
     await writeState(wsDir, state);
 
-    const { downloaded, uploaded, skipped, failed, created, purged, deletedLocal, deletedRemote } = ctx.counts;
+    const { downloaded, uploaded, skipped, failed, created, purged, deletedLocal, deletedRemote, conflicts } = ctx.counts;
     const cycleDurationMs = Date.now() - cycleStart;
     lastCycleTs.set({ wsId }, Math.floor(Date.now() / 1000));
     lastCycleDuration.set({ wsId }, cycleDurationMs);
@@ -616,7 +631,7 @@ const syncOne = async (wsId) => {
         ts: new Date().toISOString(),
         wsId,
         downloaded, uploaded, skipped, failed, created, purged,
-        deletedLocal, deletedRemote,
+        deletedLocal, deletedRemote, conflicts,
         queueDepth: ops.length,
         concurrency: SYNC_CONCURRENCY,
         cycleDurationMs,
@@ -624,7 +639,7 @@ const syncOne = async (wsId) => {
         p95Ms: percentile(ctx.latencies, 95)
     };
 
-    if (downloaded || uploaded || failed || purged || deletedLocal || deletedRemote) {
+    if (downloaded || uploaded || failed || purged || deletedLocal || deletedRemote || conflicts) {
         const delPart = (deletedLocal || deletedRemote) ? ` ✗L${deletedLocal} ✗R${deletedRemote}` : '';
         log(`${wsId} → ↓${downloaded} ↑${uploaded}${created ? ` (${created} nuevos)` : ''}${purged ? ` purg:${purged}` : ''}${delPart} skip:${skipped} fail:${failed} (${cycleDurationMs}ms)`);
         console.log(JSON.stringify(cycleEvt));

@@ -19,7 +19,8 @@ export const HARD_SKIP = [
     '.agora-host-sync.json',
     '.st-guide.md',
     '.scratch/',
-    '.agent-tmp/'
+    '.agent-tmp/',
+    '.agora-conflicts/'
 ];
 
 // Reglas intrínsecas siempre activas. Cubren temporales de editores que
