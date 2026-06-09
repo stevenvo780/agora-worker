@@ -23,6 +23,7 @@ import path from 'node:path';
 import os from 'node:os';
 import readline from 'node:readline/promises';
 import { spawn } from 'node:child_process';
+import { createHmac } from 'node:crypto';
 
 const CONFIG_DIR = path.join(os.homedir(), '.agora');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -57,6 +58,49 @@ const apiCall = async (cfg, path, init = {}) => {
   try { body = text ? JSON.parse(text) : null; } catch { body = text; }
   if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} — ${typeof body === 'string' ? body : JSON.stringify(body)}`);
   return body;
+};
+
+// ── Worker mode ──────────────────────────────────────────────────────────────
+// Dentro de un edu-worker, el CLI autentica como la MÁQUINA (HMAC con
+// WORKER_TOKEN+WORKER_SECRET que el container ya tiene en el env), no como un
+// usuario. Así funciona sin un PAT humano — que en un workspace COMPARTIDO sería
+// un hueco de seguridad. Reusa el endpoint sync worker-list que ya valida HMAC.
+const WORKER_TOKEN = process.env.WORKER_TOKEN || '';
+const WORKER_SECRET = (process.env.WORKER_SYNC_SECRET || process.env.WORKER_SECRET || '').trim();
+const isWorkerMode = () => Boolean(WORKER_TOKEN && WORKER_SECRET);
+const workerAuthHeaders = () => {
+  const ts = Date.now();
+  let uid = null;
+  if (WORKER_TOKEN.startsWith('personal:')) uid = WORKER_TOKEN.slice('personal:'.length);
+  const sig = createHmac('sha256', WORKER_SECRET)
+    .update(`${WORKER_TOKEN}:${ts}${uid ? `:${uid}` : ''}`).digest('hex');
+  const h = { 'X-Worker-Token': WORKER_TOKEN, 'X-Worker-Ts': String(ts), 'X-Worker-Sig': sig };
+  if (uid) h['X-Worker-Uid'] = uid;
+  return h;
+};
+const workerApiBase = async () => {
+  const env = (process.env.AGORA_BACKEND_URL || process.env.NEXUS_URL || '').replace(/\/$/, '');
+  if (env) return env;
+  const cfg = await readConfig();
+  return (cfg.apiUrl || '').replace(/\/$/, '');
+};
+const workerListFiles = async () => {
+  const base = await workerApiBase();
+  if (!base) throw new Error('sin apiUrl (AGORA_BACKEND_URL no seteado)');
+  const items = [];
+  let cursor = null;
+  do {
+    const url = new URL(`${base}/api/sync/worker-list`);
+    url.searchParams.set('workspaceId', WORKER_TOKEN);
+    url.searchParams.set('presign', 'false');
+    if (cursor) url.searchParams.set('cursor', cursor);
+    const res = await fetch(url.toString(), { headers: { ...workerAuthHeaders(), Accept: 'application/json' } });
+    if (!res.ok) throw new Error(`HTTP ${res.status} — ${(await res.text().catch(() => '')).slice(0, 140)}`);
+    const data = await res.json();
+    for (const i of (data.items || [])) items.push(i);
+    cursor = (typeof data.nextCursor === 'string' && data.nextCursor) ? data.nextCursor : null;
+  } while (cursor);
+  return items;
 };
 
 const run = (cmd, args, opts = {}) => new Promise((resolve, reject) => {
@@ -141,6 +185,14 @@ const cmdLogout = async () => {
 };
 
 const cmdWorkspaces = async () => {
+  // En worker mode `ls` lista los archivos del workspace de la máquina (vía
+  // worker-list/HMAC), no los workspaces del usuario (no hay usuario).
+  if (isWorkerMode()) {
+    const files = await workerListFiles();
+    for (const f of files) log(`${f.repoPath}\t${f.size ?? '?'}B`);
+    if (files.length === 0) log('(workspace vacío)');
+    return;
+  }
   const cfg = await readConfig();
   const ws = await apiCall(cfg, '/api/workspaces');
   if (!Array.isArray(ws)) { console.log(JSON.stringify(ws, null, 2)); return; }
@@ -154,6 +206,19 @@ const cmdWorkspaces = async () => {
 
 const cmdStatus = async (dir) => {
   const cfg = await readConfig();
+  if (isWorkerMode()) {
+    const base = await workerApiBase();
+    log(`Modo: worker (autenticación de máquina vía HMAC)`);
+    log(`Workspace: ${WORKER_TOKEN}`);
+    log(`API: ${base || '(sin apiUrl)'}`);
+    try {
+      const files = await workerListFiles();
+      log(`✅ Conectado — ${files.length} archivos en el workspace`);
+    } catch (e) {
+      log(`⚠ Conexión: ${e.message}`);
+    }
+    return;
+  }
   log(`API: ${cfg.apiUrl || '(sin login)'}`);
   log(`Usuario: ${cfg.email || cfg.uid || '(sin login)'}`);
 
