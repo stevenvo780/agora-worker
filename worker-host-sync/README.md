@@ -55,6 +55,39 @@ SUDO_PASS=<pass> ./deploy_sync_daemon.sh
 El script `desplieges-prod/deploy_sync_daemon.sh` hace rsync, `npm install --omit=dev`,
 `chown`, y `systemctl restart`. Es idempotente: se puede correr múltiples veces.
 
+## Ejecución como contenedor en un host Docker
+
+En hosts donde Agora opera mediante el socket Docker (sin instalar una unit en
+el sistema base), el daemon también se puede ejecutar con el `Dockerfile` de
+este directorio. Debe recibir únicamente:
+
+- el socket Docker en `/var/run/docker.sock`, para descubrir/revivir workers;
+- el árbol persistente de workspaces en `/data/workspaces`;
+- `WORKER_SYNC_SECRET` inyectado en runtime, nunca incorporado a la imagen;
+- acceso HTTPS saliente a AgoraBack y a las URLs firmadas de MinIO.
+
+Ejemplo (el secreto ya debe existir en el entorno del proceso que despliega):
+
+```bash
+docker build -t agora-host-sync:local worker-host-sync/
+docker run -d --name agora-host-sync \
+  --restart unless-stopped \
+  --memory 8g --memory-swap 8g \
+  -e WORKER_SYNC_SECRET \
+  -e NEXUS_URL=https://agora-backend-578238159459.us-central1.run.app \
+  -e CONCURRENCY=2 -e SYNC_CONCURRENCY=2 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /datos/agora-workers/workspaces:/data/workspaces \
+  -p 127.0.0.1:9090:9090 \
+  agora-host-sync:local
+```
+
+El bind de métricas queda restringido al loopback del host. Los workers y el
+daemon usan `restart unless-stopped`, por lo que Docker los recupera tras un
+reinicio del host sin depender de una sesión interactiva. La primera
+reconciliación puede descargar varios GB; el límite de 8 GB y la concurrencia
+acotada evitan que Docker mate el daemon por OOM durante ese arranque.
+
 ## Diagnóstico
 
 ```bash

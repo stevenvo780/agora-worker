@@ -56,26 +56,31 @@ const workerTokenCache = new Map();
 const resolveWorkerToken = async (wsId) => {
     const cached = workerTokenCache.get(wsId);
     if (cached) return cached;
-    try {
-        const out = await dockerCmd([
-            'inspect', `edu-worker-${wsId}`,
-            '--format', '{{range .Config.Env}}{{println .}}{{end}}'
-        ]);
-        const line = out.split('\n').find((l) => l.startsWith('WORKER_TOKEN='));
-        if (line) {
-            const token = line.slice('WORKER_TOKEN='.length).trim();
-            if (token) {
-                workerTokenCache.set(wsId, token);
-                return token;
+    let lastError = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            const out = await dockerCmd([
+                'inspect', `edu-worker-${wsId}`,
+                '--format', '{{range .Config.Env}}{{println .}}{{end}}'
+            ]);
+            const line = out.split('\n').find((l) => l.startsWith('WORKER_TOKEN='));
+            if (line) {
+                const token = line.slice('WORKER_TOKEN='.length).trim();
+                if (token) {
+                    workerTokenCache.set(wsId, token);
+                    return token;
+                }
             }
+            lastError = new Error('WORKER_TOKEN ausente en el contenedor');
+        } catch (e) {
+            lastError = e;
         }
-    } catch (e) {
-        verbose(`resolveWorkerToken(${wsId}) fail:`, e.message);
+        if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
     }
-    // Fallback conservador: usar wsId crudo (comportamiento anterior). Esto
-    // rompe personal workspaces pero evita romper shared si inspect falla.
-    workerTokenCache.set(wsId, wsId);
-    return wsId;
+    // Nunca degradar al id crudo: para un workspace personal eso firma una
+    // identidad shared inexistente y puede intentar sincronizar con el destino
+    // equivocado. Es más seguro omitir este ciclo y reintentar en el siguiente.
+    throw new Error(`no se pudo resolver WORKER_TOKEN para ${wsId}: ${lastError?.message ?? 'error desconocido'}`);
 };
 
 const authHeaders = (token, userId = null) => buildAuthHeaders(WORKER_SECRET, token, userId);
