@@ -8,7 +8,7 @@
   nunca desde este repositorio.
 - `ils-server` (`100.64.0.5`, `148.230.88.162`) está apagado desde el
   16-ago-2026 y no es un destino productivo.
-- Workers: 40 contenedores `edu-worker-*`, con `restart=unless-stopped`.
+- Workers: 41 contenedores `edu-worker-*`, con `restart=unless-stopped`.
 - Persistencia: `/datos/agora-workers/workspaces/<id>` y
   `/datos/agora-workers/home/<id>`.
 - Host sync: contenedor `agora-host-sync`, no unidad systemd. Imagen observada:
@@ -23,10 +23,11 @@ ssh vps-tn 'docker ps --filter name=edu-worker --format "{{.Names}}" | wc -l'
 ssh vps-tn 'df -h / && free -h'
 ```
 
-El 25-ago-2026 se verificaron directamente 40/40 workers `Up`, host-sync
+El 25-ago-2026 se verificaron directamente 41/41 workers `Up`, host-sync
 `healthy` con cero reinicios, disco al 75 % con 115 GiB libres y 28 GiB de RAM
-disponible. La actividad de Cloud Run mostró polls HTTP 200 de los 40
-workspaces desde la IP pública del host.
+disponible. El worker 41 corresponde a `Descartes`
+(`lzYPWlMdecYzW4eus4BX`); AgoraBack registró ciclos `worker-list` HTTP 200
+desde la IP pública del host.
 
 ## Operación
 

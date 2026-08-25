@@ -1,7 +1,7 @@
 # AgoraWorker
 
 Runtime de workers por workspace y daemon host-sync. En producción
-corren 40 containers `edu-worker-<wsId>` en `vps-humanizar-2`
+corren 41 containers `edu-worker-<wsId>` en `vps-humanizar-2`
 (`100.64.0.11`, pública `167.114.118.213`).
 Todos apuntan al hub vía `NEXUS_URL=https://hub.elenxos.com`.
 
