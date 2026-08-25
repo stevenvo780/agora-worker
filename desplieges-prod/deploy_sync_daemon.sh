@@ -17,7 +17,12 @@
 
 set -euo pipefail
 
-HOST="${1:-ils-server}"
+if [[ "${ALLOW_LEGACY_SYSTEMD_SYNC_DEPLOY:-0}" != "1" ]]; then
+  echo "ERROR: producción usa agora-host-sync como contenedor; ver docs/RUNTIME-PROD-2026-08-25.md" >&2
+  exit 1
+fi
+
+HOST="${1:?host legacy requerido}"
 SUDO_PASS="${SUDO_PASS:?env SUDO_PASS required}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_DIR="$(cd "${SCRIPT_DIR}/../worker-host-sync" && pwd)"

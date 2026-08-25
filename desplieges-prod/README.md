@@ -2,11 +2,13 @@
 
 ## Fuente de verdad
 
-La referencia operativa principal para workers y hub ahora es:
+La referencia operativa principal para workers es:
 
-- `docs/08-edu-workers-stev-server.md`
+- `../docs/RUNTIME-PROD-2026-08-25.md`
 
-Este `README` queda como chuleta rápida de comandos.
+Los scripts basados en `edu-worker-manager`/systemd son históricos y quedan
+bloqueados por defecto: apuntaban al `ils-server` retirado. No usarlos para el
+runtime actual basado íntegramente en Docker.
 
 ---
 
@@ -14,15 +16,15 @@ Este `README` queda como chuleta rápida de comandos.
 
 | Campo | Valor |
 |---|---|
-| Alias SSH | `ils-server` |
-| IP NetBird | `100.98.245.50` |
-| Usuario | `humanizar` |
-| Rol | Workers (43 edu-worker-*) |
+| Alias SSH | `vps-tn` (malla) / `vps` (pública) |
+| IP | `100.64.0.11` / `167.114.118.213` |
+| Usuario | `root` |
+| Rol | Workers (40 `edu-worker-*`) + `agora-host-sync` Docker |
 
 Acceso:
 
 ```bash
-ssh ils-server
+ssh vps-tn
 ```
 
 ---
@@ -53,7 +55,9 @@ Con versión explícita de ST:
 ./desplieges-prod/deploy_docker.sh 4.15.1
 ```
 
-> El script construye la imagen con `ST_LANG_VERSION` explícita (si se la pasas), la publica y luego ejecuta `edu-worker-manager update all` en `ils-server`. Si `sudo` remoto requiere contraseña, la pedirá en la terminal o puede recibirse por variable de entorno sin dejarla hardcodeada en el repo.
+> Este script pertenece al runtime retirado de `ils-server` y aborta por
+> defecto. No ejecutarlo contra `vps-humanizar-2`: allí los workers y host-sync
+> se gestionan como contenedores con configuración preservada.
 
 ### 4. Worker — `.deb` del manager + update all
 
@@ -101,10 +105,10 @@ grep -E 'NEXUS_URL|WORKER_SOCKET_SECRET|WORKER_SYNC_SECRET|WORKER_SECRET_PREVIOU
 ## Verificaciones mínimas
 
 ```bash
-ssh ils-server
-sudo edu-worker-manager status
-sudo docker ps --filter name=edu-worker
-sudo docker exec $(sudo docker ps --filter name=edu-worker --format '{{.Names}}' | head -n 1) st --version
+ssh vps-tn
+docker ps --filter name=edu-worker
+docker inspect agora-host-sync --format '{{.State.Status}}/{{.State.Health.Status}}'
+docker exec $(docker ps --filter name=edu-worker --format '{{.Names}}' | head -n 1) st --version
 # Hub (en agora-storage):
 ssh root@76.13.118.239 'systemctl status edu-hub'
 curl -s https://hub.elenxos.com/health
@@ -118,7 +122,7 @@ curl -s https://hub.elenxos.com/health
 |---|---|
 | Timeout al hub | `NEXUS_URL` en `/etc/edu-worker/worker.env` |
 | Auth failure | `WORKER_SOCKET_SECRET` para Hub o `WORKER_SYNC_SECRET` para Back/host-sync |
-| Worker no reaparece | `sudo edu-worker-manager update all` + logs |
+| Worker no reaparece | `docker inspect` + logs de `agora-host-sync`; no recrear sin preservar mounts/env |
 | ST sigue viejo | reconstruir imagen y no solo hotfix interno |
 
 ---

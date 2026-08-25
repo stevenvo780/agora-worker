@@ -1,9 +1,11 @@
 # agora-host-sync
 
-Daemon que corre en el host de los workers (`ils-server`, `100.98.245.50`, user `humanizar`).
+Daemon que corre como contenedor en `vps-humanizar-2` (`100.64.0.11`,
+pública `167.114.118.213`, user `root`). `ils-server` está apagado desde el
+16-ago-2026 y ya no es un destino productivo.
 Por cada contenedor `edu-worker-*` corriendo:
 
-- Mantiene `/home/humanizar/edu-worker/workspaces/<wsId>/` espejado con la
+- Mantiene `/datos/agora-workers/workspaces/<wsId>/` espejado con la
   workspace en MinIO + AgoraBack (bidireccional).
 - Revive automáticamente cualquier contenedor `edu-worker-*` que esté
   Exited (Docker CE 29.5.2 en ils-server no presenta el bug de HTTP/2
@@ -12,7 +14,10 @@ Por cada contenedor `edu-worker-*` corriendo:
   resolver el token correcto de workspaces personales (`personal:<uid>`),
   en lugar de usar el `wsId` crudo que causaba 500 "Owner not resolvable".
 
-## Instalación en ils-server
+## Instalación systemd histórica (no usar en producción actual)
+
+La sección siguiente sólo sirve para reconstruir el host retirado. Producción
+usa el contenedor documentado en "Ejecución como contenedor".
 
 ```bash
 # Como root:
@@ -88,20 +93,18 @@ reinicio del host sin depender de una sesión interactiva. La primera
 reconciliación puede descargar varios GB; el límite de 8 GB y la concurrencia
 acotada evitan que Docker mate el daemon por OOM durante ese arranque.
 
-## Diagnóstico
+## Diagnóstico productivo
 
 ```bash
-# Estado del daemon
-systemctl status agora-host-sync
+# Estado y health
+docker inspect agora-host-sync --format '{{.State.Status}}/{{.State.Health.Status}} reinicios={{.RestartCount}}'
 
-# Logs en tiempo real
-tail -f /home/humanizar/logs/agora-host-sync.log
+# Logs recientes / tiempo real
+docker logs --tail 100 agora-host-sync
+docker logs -f agora-host-sync
 
-# Logs estructurados con jq
-journalctl -u agora-host-sync -o cat | jq .
-
-# Reinicio manual
-sudo systemctl restart agora-host-sync
+# Reinicio manual (sólo después de preservar evidencia)
+docker restart agora-host-sync
 
 # Crashes del docker daemon
 sudo journalctl -u docker.service | grep -iE "fatal|panic"

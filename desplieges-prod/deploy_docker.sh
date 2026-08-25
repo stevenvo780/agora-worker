@@ -5,7 +5,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REMOTE_HOST="${WORKER_HOST:-humanizar@100.98.245.50}"
+if [[ "${ALLOW_LEGACY_ILSSERVER_DEPLOY:-0}" != "1" ]]; then
+	echo "ERROR: deploy_docker.sh pertenece al ils-server retirado; ver docs/RUNTIME-PROD-2026-08-25.md" >&2
+	exit 1
+fi
+REMOTE_HOST="${WORKER_HOST:?WORKER_HOST es obligatorio para un rollout legacy}"
 REMOTE_SUDO_PASS="${WORKER_SUDO_PASS:-}"
 IMAGE="${WORKER_IMAGE:-stevenvo780/edu-worker:latest}"
 ST_LANG_VERSION="${1:-}"

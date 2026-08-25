@@ -1,7 +1,8 @@
 # AgoraWorker
 
 Runtime de workers por workspace y daemon host-sync. En producción
-corren ~43 containers `edu-worker-<wsId>` en `ils-server` (host activo).
+corren 40 containers `edu-worker-<wsId>` en `vps-humanizar-2`
+(`100.64.0.11`, pública `167.114.118.213`).
 Todos apuntan al hub vía `NEXUS_URL=https://hub.elenxos.com`.
 
 > **Operación / restart / docker daemon crashes**: ver [`../RUNBOOK_OPS.md §3, §12`](../RUNBOOK_OPS.md).
@@ -10,7 +11,7 @@ Todos apuntan al hub vía `NEXUS_URL=https://hub.elenxos.com`.
 ## Partes
 
 - `worker/`: contenedor Node que abre PTY, se registra en AgoraHub y ejecuta comandos del agente bajo whitelist (~40 binarios seguros, incluye `base64` agregado en 2026-05). El handler `runWorkerCommand` aplica una policy tri-tier: destructivos siempre piden confirm, safe-reads ejecutan directo, resto requiere confirm.
-- `worker-host-sync/`: daemon del host (`agora-host-sync.service`) que sincroniza `/workspace` contra AgoraBack/MinIO/Firestore cada 5s y revive containers caídos. Ignora `.scratch/`, `.agent-tmp/`, `tmp-*`, `*.tmp` (Bug I-2 Opción B).
+- `worker-host-sync/`: contenedor `agora-host-sync` que sincroniza `/workspace` contra AgoraBack/MinIO/Firestore cada 5s y revive containers caídos. Ignora `.scratch/`, `.agent-tmp/`, `tmp-*`, `*.tmp` (Bug I-2 Opción B).
 - `desplieges-prod/`: scripts operativos de despliegue (`deploy_hub.sh`, `deploy_docker.sh`, `update_st_workers.sh`).
 
 ## Comportamiento conocido
@@ -60,15 +61,16 @@ cd worker
 docker build -t stevenvo780/edu-worker:latest .
 docker push stevenvo780/edu-worker:latest
 
-# Recrear los ~43 containers con la imagen nueva
-ssh ils-server 'echo PASS | sudo -S edu-worker-manager update all'
+# Producción ya no usa edu-worker-manager ni ils-server.
+# Ver docs/RUNTIME-PROD-2026-08-25.md antes de hacer el rollout.
 ```
 
-### Daemon agora-host-sync
+### Contenedor agora-host-sync
 
 ```bash
-cd worker-host-sync
-./deploy.sh    # ver scripts internos; copia agora-host-sync.mjs y reinicia systemd
+docker build -t agora-host-sync:local worker-host-sync/
+# El rollout productivo conserva los mounts/env/restart policy existentes.
+# Ver docs/RUNTIME-PROD-2026-08-25.md.
 ```
 
 Cada worker se reconecta al hub en <5s tras recreación.
