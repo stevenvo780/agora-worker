@@ -1,9 +1,11 @@
 # agora-host-sync
 
-Daemon que corre en el host de los workers (`ils-server`, `100.98.245.50`, user `humanizar`).
+Daemon que corre como contenedor en `vps-humanizar-2` (`100.64.0.11`,
+pública `167.114.118.213`, user `root`). `ils-server` está apagado desde el
+16-ago-2026 y ya no es un destino productivo.
 Por cada contenedor `edu-worker-*` corriendo:
 
-- Mantiene `/home/humanizar/edu-worker/workspaces/<wsId>/` espejado con la
+- Mantiene `/datos/agora-workers/workspaces/<wsId>/` espejado con la
   workspace en MinIO + AgoraBack (bidireccional).
 - Revive automáticamente cualquier contenedor `edu-worker-*` que esté
   Exited (Docker CE 29.5.2 en ils-server no presenta el bug de HTTP/2
@@ -12,7 +14,10 @@ Por cada contenedor `edu-worker-*` corriendo:
   resolver el token correcto de workspaces personales (`personal:<uid>`),
   en lugar de usar el `wsId` crudo que causaba 500 "Owner not resolvable".
 
-## Instalación en ils-server
+## Instalación systemd histórica (no usar en producción actual)
+
+La sección siguiente sólo sirve para reconstruir el host retirado. Producción
+usa el contenedor documentado en "Ejecución como contenedor".
 
 ```bash
 # Como root:
@@ -55,20 +60,51 @@ SUDO_PASS=<pass> ./deploy_sync_daemon.sh
 El script `desplieges-prod/deploy_sync_daemon.sh` hace rsync, `npm install --omit=dev`,
 `chown`, y `systemctl restart`. Es idempotente: se puede correr múltiples veces.
 
-## Diagnóstico
+## Ejecución como contenedor en un host Docker
+
+En hosts donde Agora opera mediante el socket Docker (sin instalar una unit en
+el sistema base), el daemon también se puede ejecutar con el `Dockerfile` de
+este directorio. Debe recibir únicamente:
+
+- el socket Docker en `/var/run/docker.sock`, para descubrir/revivir workers;
+- el árbol persistente de workspaces en `/data/workspaces`;
+- `WORKER_SYNC_SECRET` inyectado en runtime, nunca incorporado a la imagen;
+- acceso HTTPS saliente a AgoraBack y a las URLs firmadas de MinIO.
+
+Ejemplo (el secreto ya debe existir en el entorno del proceso que despliega):
 
 ```bash
-# Estado del daemon
-systemctl status agora-host-sync
+docker build -t agora-host-sync:local worker-host-sync/
+docker run -d --name agora-host-sync \
+  --restart unless-stopped \
+  --memory 8g --memory-swap 8g \
+  -e WORKER_SYNC_SECRET \
+  -e NEXUS_URL=https://agora-backend-578238159459.us-central1.run.app \
+  -e CONCURRENCY=2 -e SYNC_CONCURRENCY=2 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /datos/agora-workers/workspaces:/data/workspaces \
+  -p 127.0.0.1:9090:9090 \
+  agora-host-sync:local
+```
 
-# Logs en tiempo real
-tail -f /home/humanizar/logs/agora-host-sync.log
+El bind de métricas queda restringido al loopback del host. Los workers y el
+daemon usan `restart unless-stopped`, por lo que Docker los recupera tras un
+reinicio del host sin depender de una sesión interactiva. La primera
+reconciliación puede descargar varios GB; el límite de 8 GB y la concurrencia
+acotada evitan que Docker mate el daemon por OOM durante ese arranque.
 
-# Logs estructurados con jq
-journalctl -u agora-host-sync -o cat | jq .
+## Diagnóstico productivo
 
-# Reinicio manual
-sudo systemctl restart agora-host-sync
+```bash
+# Estado y health
+docker inspect agora-host-sync --format '{{.State.Status}}/{{.State.Health.Status}} reinicios={{.RestartCount}}'
+
+# Logs recientes / tiempo real
+docker logs --tail 100 agora-host-sync
+docker logs -f agora-host-sync
+
+# Reinicio manual (sólo después de preservar evidencia)
+docker restart agora-host-sync
 
 # Crashes del docker daemon
 sudo journalctl -u docker.service | grep -iE "fatal|panic"
