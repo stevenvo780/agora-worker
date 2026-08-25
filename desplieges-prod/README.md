@@ -19,7 +19,7 @@ runtime actual basado íntegramente en Docker.
 | Alias SSH | `vps-tn` (malla) / `vps` (pública) |
 | IP | `100.64.0.11` / `167.114.118.213` |
 | Usuario | `root` |
-| Rol | Workers (40 `edu-worker-*`) + `agora-host-sync` Docker |
+| Rol | Workers (41 `edu-worker-*`) + `agora-host-sync` Docker |
 
 Acceso:
 
