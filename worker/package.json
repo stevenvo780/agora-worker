@@ -10,7 +10,6 @@
     "lint": "eslint \"*.js\""
   },
   "dependencies": {
-    "@dataconnect/generated": "file:src/dataconnect-generated",
     "chokidar": "^3.6.0",
     "firebase": "^12.12.1",
     "node-pty": "^1.0.0",
